@@ -101,17 +101,23 @@ export RK_CAMERA_SENSOR_CAC_BIN="CAC_sc4336_OT01_40IRC_F16"
 # export RK_BUILD_APP_TO_OEM_PARTITION=y
 
 # enable rockchip test
-export RK_ENABLE_ROCKCHIP_TEST=y
+# export RK_ENABLE_ROCKCHIP_TEST=y
 
 #################################################
 # 	PRE and POST
 #################################################
 
 # specify pre.sh for delete/overlay files
-export RK_PRE_BUILD_OEM_SCRIPT=luckfox-buildroot-oem-pre.sh
+# OpenAstroGuider: strips the ISP/media/NPU/audio stack (raw V4L2 capture only);
+# folds in the deletions from the stock luckfox-buildroot-oem-pre.sh too, since
+# only one script can be named here.
+export RK_PRE_BUILD_OEM_SCRIPT=luckfox-astroguider-oem-pre.sh
 
 # specify post.sh for delete/overlay files
 export RK_PRE_BUILD_USERDATA_SCRIPT=luckfox-userdata-pre.sh
 
 # declare overlay directory
-export RK_POST_OVERLAY="overlay-luckfox-config overlay-luckfox-buildroot-init overlay-luckfox-buildroot-shadow"
+# overlay-luckfox-astroguider: trims RkLunch.sh/insmod_ko.sh to raw V4L2 capture only
+# (no rkipc, no ISP/RGA/MPP/NPU/audio/motor kernel modules) and disables
+# iptables/telnet/sshd/micinit at boot.
+export RK_POST_OVERLAY="overlay-luckfox-config overlay-luckfox-buildroot-init overlay-luckfox-buildroot-shadow overlay-luckfox-astroguider"

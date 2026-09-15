@@ -1,0 +1,10 @@
+#!/bin/sh
+
+case $1 in
+	start)
+		echo "micinit disabled (OpenAstroGuider debloat) -- no audio use case"
+		;;
+	*)
+		exit 1
+		;;
+esac
