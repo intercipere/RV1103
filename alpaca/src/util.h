@@ -55,4 +55,10 @@ void alpaca_response_string(char *buf, size_t buflen, const char *value,
 void alpaca_response_error(char *buf, size_t buflen, long client_txn_id,
                             int error_number, const char *error_message);
 
+/* Exposes the same monotonic ServerTransactionID counter alpaca_response()
+ * uses internally, for callers building a response by hand (e.g. the
+ * ImageBytes binary format) that still need to participate in the same
+ * global sequence real Alpaca clients expect. */
+long alpaca_next_server_txn(void);
+
 #endif

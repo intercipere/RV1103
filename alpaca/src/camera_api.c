@@ -147,18 +147,19 @@ static int h_startexposure(struct mg_connection *conn, params_t *params,
 	return 1;
 }
 
-/* Streams the ImageArray as a JSON 2D array directly to the socket instead
- * of building the whole (multi-MB, for a 2304x1296 frame) string in RAM
- * first -- this device has 64MB total RAM. Sent with "Connection: close"
- * and no Content-Length so the body can be streamed without knowing its
- * final size up front (valid per RFC 7230 -- the connection close marks
- * the end of body). ImageBytes (the binary alternative) is not implemented
- * yet -- see README.md.
+/* Row-major [row][col] nesting (outer index = row/Y, inner index = col/X) is
+ * confirmed correct per ASCOM's own alpyca reference client docstring:
+ * "The returned array is in row-major format" -- verified 2026-09-15 by
+ * reading alpyca/camera.py directly rather than guessing. Dimension1 in
+ * ImageBytes below is likewise the row count (height), Dimension2 the
+ * column count (width), matching alpyca's own JSON-path shape inference
+ * (`len(l)` -> Dimension1, `len(l[0])` -> Dimension2).
  *
- * NOTE: row-major [row][col] nesting is what's implemented here; the exact
- * element ordering the Alpaca spec requires has NOT been independently
- * re-verified against the API Reference PDF or a real client (e.g. the
- * ASCOM Conformance tool) -- treat this as unverified until checked.
+ * Sends application/imagebytes (see send_imagebytes below) when the client
+ * requests it via `Accept: application/imagebytes` (this is what real
+ * Alpaca clients -- including whatever PHD2/N.I.N.A. use under the hood --
+ * negotiate for automatically to avoid the JSON path's ~2x size and heavy
+ * parse cost), otherwise falls back to this streamed JSON path.
  *
  * Two-pass: first pass counts the exact output byte length with cheap
  * integer digit-counting (no allocation, no formatting), then a second
@@ -179,6 +180,59 @@ static int udigits(unsigned v) {
 		n++;
 	}
 	return n;
+}
+
+/* ASCOM ImageBytes binary transfer (see
+ * https://www.ascom-standards.org/Developer/AlpacaImageBytes.pdf) -- 11
+ * little-endian int32 fields (44 bytes) followed by raw pixel data. Field
+ * layout and ImageArrayElementTypes enum values (UInt16=8) confirmed
+ * 2026-09-15 by reading ASCOM's own alpyca reference client source
+ * directly (alpaca/camera.py's _build_imagedata_array), not guessed:
+ *   [0:4]   MetadataVersion   [4:8]   ErrorNumber
+ *   [8:12]  ClientTransactionID  [12:16] ServerTransactionID
+ *   [16:20] DataStart (=44)   [20:24] ImageElementType
+ *   [24:28] TransmissionElementType   [28:32] Rank
+ *   [32:36] Dimension1 (=height, row-major)  [36:40] Dimension2 (=width)
+ *   [40:44] Dimension3 (0 for Rank 2)
+ * Streams directly from the existing pixel buffer with a single mg_write
+ * -- no extra allocation, unlike the JSON path, since the data is already
+ * in the right in-memory representation (uint16_t, and this ARM target is
+ * little-endian so no byte-swapping is needed either). */
+#define IMAGEBYTES_HEADER_LEN 44
+static void put_le32(unsigned char *p, int32_t v) {
+	p[0] = (unsigned char)(v & 0xff);
+	p[1] = (unsigned char)((v >> 8) & 0xff);
+	p[2] = (unsigned char)((v >> 16) & 0xff);
+	p[3] = (unsigned char)((v >> 24) & 0xff);
+}
+
+static void send_imagebytes(struct mg_connection *conn, long client_txn_id) {
+	int w = g_device.last_frame.width, h = g_device.last_frame.height;
+	uint16_t *pixels = g_device.last_frame.pixels;
+	long long body_len = IMAGEBYTES_HEADER_LEN + (long long)w * h * (long long)sizeof(uint16_t);
+
+	unsigned char hdr[IMAGEBYTES_HEADER_LEN];
+	put_le32(hdr + 0, 1);                          /* MetadataVersion */
+	put_le32(hdr + 4, 0);                          /* ErrorNumber */
+	put_le32(hdr + 8, (int32_t)client_txn_id);
+	put_le32(hdr + 12, (int32_t)alpaca_next_server_txn());
+	put_le32(hdr + 16, IMAGEBYTES_HEADER_LEN);     /* DataStart */
+	put_le32(hdr + 20, 8);                         /* ImageElementType = UInt16 */
+	put_le32(hdr + 24, 8);                         /* TransmissionElementType = UInt16 */
+	put_le32(hdr + 28, 2);                         /* Rank */
+	put_le32(hdr + 32, h);                         /* Dimension1 = height */
+	put_le32(hdr + 36, w);                         /* Dimension2 = width */
+	put_le32(hdr + 40, 0);                         /* Dimension3 */
+
+	char len_str[32];
+	snprintf(len_str, sizeof(len_str), "%lld", body_len);
+
+	mg_response_header_start(conn, 200);
+	mg_response_header_add(conn, "Content-Type", "application/imagebytes", -1);
+	mg_response_header_add(conn, "Content-Length", len_str, -1);
+	mg_response_header_send(conn);
+	mg_write(conn, hdr, sizeof(hdr));
+	mg_write(conn, pixels, (size_t)w * h * sizeof(uint16_t));
 }
 
 static void send_imagearray(struct mg_connection *conn, long client_txn_id) {
@@ -492,7 +546,17 @@ static int camera_dispatch(struct mg_connection *conn, void *cbdata) {
 	}
 	if (strcasecmp(member, "imagearray") == 0 ||
 	    strcasecmp(member, "imagearrayvariant") == 0) {
-		send_imagearray(conn, client_txn_id);
+		const char *accept = mg_get_header(conn, "Accept");
+		pthread_mutex_lock(&g_device.lock);
+		int ready = g_device.image_ready && g_device.last_frame.pixels != NULL;
+		pthread_mutex_unlock(&g_device.lock);
+		if (ready && accept != NULL && strstr(accept, "application/imagebytes") != NULL) {
+			pthread_mutex_lock(&g_device.lock);
+			send_imagebytes(conn, client_txn_id);
+			pthread_mutex_unlock(&g_device.lock);
+		} else {
+			send_imagearray(conn, client_txn_id);
+		}
 		return 200;
 	}
 	if (strcasecmp(member, "startexposure") == 0) {

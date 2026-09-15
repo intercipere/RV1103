@@ -271,15 +271,38 @@ starting an exposure errored out. Two real bugs, both fixed and verified on hard
    `curl`'s actual downloaded size exactly, memory flat before/after (no growth, unlike the crash-inducing
    full-buffer attempt above), valid 1296×2304 JSON output.
 
-- **Not tested against the ASCOM Conformance Universal tool.**
-  In particular, **`imagearray`'s row/column element ordering has not been independently verified against
-  the ASCOM Alpaca API Reference PDF** — `camera_api.c`'s `send_imagearray()` emits row-major `[row][col]`
-  nesting, flagged in-code as unverified. This is exactly the kind of convention that's easy to get
-  backwards and easy to verify with a real client, so don't trust it silently.
-- **`ImageBytes` binary transfer not implemented** — `imagearray` is JSON-only today. A real captured
-  frame serializes to ~11.2MB of JSON (measured) for a 5.97MB raw uint16 payload — roughly 2x overhead
-  from ASCII digits/commas. Worth doing now that real-client testing is underway, given the JSON path's
-  size is a real concern on a ~32MB device (see above), not just a bandwidth nicety.
+## Follow-up (same day): got real PHD2 guiding, then chased two more issues
+
+Got actual guide exposures out of PHD2 end-to-end. Two things came up:
+
+1. **"Images arrive every 5-10s" — root cause found: the JSON `imagearray` payload itself.** PHD2 has no
+   native Alpaca HTTP client; it connects via the classic ASCOM COM interface, so the actual HTTP requests
+   come from the **ASCOM Platform's Alpaca-to-COM bridge**, a client library that (like `alpyca`)
+   auto-negotiates for the faster binary format when available. `ImageBytes` is now implemented
+   (`send_imagebytes()` in `camera_api.c`): 11 little-endian int32 header fields (44 bytes) followed by
+   the raw `uint16_t` pixel buffer, streamed with a **single `mg_write`** straight from the existing
+   capture buffer — no extra allocation at all, safer on this ~32MB device than even the JSON path's small
+   scratch buffer. Field layout and enum values (`UInt16=8`) were taken directly from ASCOM's own `alpyca`
+   reference client source (`_build_imagedata_array` in `camera.py`), not guessed. **Verified: 0.68-0.70s
+   fetch time versus 6.4s for JSON — roughly 9x faster** — with `alpyca` itself successfully decoding it
+   (correct shape, dtype, pixel values) and a manual Python `struct.unpack` decode matching exactly.
+   This also **definitively resolves the previously-flagged "unverified row/column ordering" question**:
+   alpyca's own docstring states the wire format is row-major, and its shape report
+   (`(1296, 2304)` = `(CameraYSize, CameraXSize)`) confirms `camera_api.c`'s existing `[row][col]` nesting
+   was already correct — no ordering bug ever existed.
+2. **"Exposure duration doesn't seem to apply" — confirmed NOT a server-side bug.** Tested directly:
+   0.01s exposure → mean pixel value 85 (max 650); 1s exposure → mean 677, **saturating at 1023** (full
+   overexposure, exactly as expected in daylight). Server-side duration handling is correct; if PHD2 still
+   shows this, the mismatch is somewhere between PHD2/the ASCOM bridge and what it actually sends — worth
+   checking with `alpaca/test_client.py` against varying durations from the PHD2/Windows side, or checking
+   PHD2's own logs for the literal `Duration` value it's transmitting.
+3. **RAM re-confirmed via `dmesg`, with the full explanation**: `Memory: 32368K/65536K available ...
+   24576K cma-reserved` — the chip genuinely has **64MB physical RAM** (not wrong to assume that), but
+   24MB is reserved for the Contiguous Memory Allocator (`RK_BOOTARGS_CMA_SIZE="24M"` in the board
+   config), leaving ~32MB for normal `malloc()`/`MemTotal` — which is what actually OOM'd. This 24MB was
+   almost certainly sized for the stock ISP/RGA/MPP/rockit pipeline this project already stripped out;
+   shrinking it would give some of that 32MB back, but hasn't been attempted (risk: verify rkcif's V4L2
+   buffers still allocate fine at a smaller CMA size before shipping this).
 
 ## Known gaps / not yet done
 

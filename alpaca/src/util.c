@@ -121,6 +121,10 @@ static long next_server_txn(void) {
 	return id;
 }
 
+long alpaca_next_server_txn(void) {
+	return next_server_txn();
+}
+
 void alpaca_response(char *buf, size_t buflen, const char *value_json,
                       long client_txn_id, int error_number,
                       const char *error_message) {

@@ -114,9 +114,12 @@ This clone (`https://github.com/intercipere/RV1103`, forked from `LuckfoxTECH/lu
 adapted into a custom astronomy guide camera: a mono IMX290 sensor on a custom PCB around a Rockchip
 RV1106G3 SoC (256MB RAM), replacing an off-the-shelf colour IMX290 USB module capped at 0.5s exposures.
 Goal is long exposures without relying on PHD2 live stacking. Current prototyping platform is the Luckfox
-Pico (RV1103, **~32MB RAM as reported by Linux** — `MemTotal` is 32588kB, not the 64MB assumed earlier;
-corrected 2026-09-15 after a real OOM crash during Alpaca driver testing, see below — proved too tight
-for buffering multiple full-res frames) with a Waveshare SC3336
+Pico (RV1103, **64MB physical RAM, ~32MB usable** — confirmed via `dmesg`:
+`Memory: 32368K/65536K available ... 24576K cma-reserved`; the chip has the full 64MB, but 24MB is
+reserved for the Contiguous Memory Allocator (`RK_BOOTARGS_CMA_SIZE="24M"`, almost certainly sized for
+the stock ISP/RGA/MPP/rockit pipeline this project already stripped out), leaving `MemTotal`/`malloc()`
+with ~32MB — confirmed the hard way via a real OOM crash during Alpaca driver testing, see below — proved
+too tight for buffering multiple full-res frames) with a Waveshare SC3336
 camera module standing in for the IMX290 until the PCB exists. **The Luckfox Pico board and the SC3336
 are both temporary prototyping stand-ins, not the production target** — production is the custom PCB
 (RV1106G3 + IMX290), not Luckfox hardware. The SC3336's known exposure ceiling is an accepted limitation
@@ -286,10 +289,24 @@ link-local networking fix over the real link, not just `adb forward`. Discovery 
 from plugging in (not yet investigated — likely IPv4LL's probe/announce timing, RFC 3927 allows up to
 ~9s of probing alone before even attempting to bind).
 
-**Not yet done:** tested against the ASCOM Conformance tool (`imagearray`'s row/column element ordering
-is implemented but not independently re-verified against the spec PDF); `ImageBytes` binary transfer
-(currently JSON-only; ~11.2MB JSON for a 5.97MB raw frame, measured); investigate the 15-20s discovery
-delay.
+**Follow-up, same day: real PHD2 guiding achieved, then two more issues chased.** Got actual guide
+exposures out of PHD2. "Images every 5-10s" root cause: JSON `imagearray`'s size/parse cost — PHD2 has no
+native Alpaca client, it connects via the ASCOM Platform's Alpaca-to-COM bridge, which (like `alpyca`)
+auto-negotiates the faster binary format when offered. **`ImageBytes` is now implemented** (11 little-
+endian int32 header fields + raw `uint16_t` data, streamed via a single `mg_write` straight from the
+existing capture buffer — no extra allocation, safer than even the JSON path on this ~32MB device). Field
+layout taken directly from ASCOM's own `alpyca` client source, not guessed. **Verified 0.68-0.70s fetch
+vs 6.4s for JSON (~9x faster)**, confirmed correct via both a manual decode and `alpyca` itself. This also
+**definitively resolves the row/column ordering question** — alpyca's own docs confirm row-major, and its
+shape report matches `camera_api.c`'s existing `[row][col]` nesting exactly; there was never an ordering
+bug. Separately, "exposure duration doesn't apply" was tested and is **not a server-side bug**: 0.01s
+exposure gave mean 85, 1s exposure gave mean 677 with the sensor saturating at 1023 (full overexposure,
+correct daylight behavior) — if PHD2 still shows this, the mismatch is between PHD2/the ASCOM bridge and
+what's actually transmitted, not our exposure control.
+
+**Not yet done:** tested against the ASCOM Conformance tool; investigate the 15-20s discovery delay
+(likely IPv4LL probe/announce timing, RFC 3927 allows ~9s of probing alone); diagnose PHD2's
+duration-not-applied symptom from the client side, now that the server side is proven correct.
 
 PC-side tooling: `grab.py` was the sensor-bringup/testing tool and **is no longer being maintained** —
 the project has moved on to the on-device Alpaca driver above; `grab.py` and its diagnostic siblings
