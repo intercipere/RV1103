@@ -1,0 +1,27 @@
+#!/bin/sh
+#
+# OpenAstroGuider Alpaca camera driver. Started after S50usbdevice brings up
+# usb0 (RNDIS, static IP) and S41dhcpcd handles eth0, so both transports the
+# Alpaca discovery/HTTP API relies on are already up. See ../../alpaca/README.md
+# in the repo (not shipped on-device) for what this actually does.
+
+DAEMON=/usr/bin/alpacad
+LOG=/tmp/alpacad.log
+
+case "$1" in
+	start)
+		echo "Starting alpacad..."
+		$DAEMON </dev/null >"$LOG" 2>&1 &
+		;;
+	stop)
+		echo "Stopping alpacad..."
+		killall alpacad 2>/dev/null
+		;;
+	restart)
+		"$0" stop
+		"$0" start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+esac

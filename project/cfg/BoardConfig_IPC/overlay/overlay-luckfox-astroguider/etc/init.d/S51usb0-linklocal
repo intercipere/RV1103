@@ -1,0 +1,22 @@
+#!/bin/sh
+#
+# OpenAstroGuider: undo S50usbdevice's hardcoded static IP (172.32.0.70) on
+# usb0, so dhcpcd's own DHCP-then-IPv4LL fallback becomes the final,
+# authoritative address instead. dhcpcd is already running (started by
+# S41dhcpcd) and already correctly implements RFC 3927 link-local
+# self-assignment for exactly this case (no DHCP server on a point-to-point
+# link) -- confirmed via its own log: "probing for an IPv4LL address" ->
+# "using IPv4LL address 169.254.x.x" -> "adding route to 169.254.0.0/16".
+# Windows/macOS/Linux all self-assign a compatible 169.254.0.0/16 address
+# automatically in this situation, so no user-side IP configuration is
+# needed on any OS. The Alpaca discovery UDP broadcast (port 32227)
+# doesn't care what the specific address ends up being.
+
+case "$1" in
+	start)
+		ifconfig usb0 0.0.0.0
+		;;
+	*)
+		exit 1
+		;;
+esac

@@ -115,7 +115,12 @@ adapted into a custom astronomy guide camera: a mono IMX290 sensor on a custom P
 RV1106G3 SoC (256MB RAM), replacing an off-the-shelf colour IMX290 USB module capped at 0.5s exposures.
 Goal is long exposures without relying on PHD2 live stacking. Current prototyping platform is the Luckfox
 Pico (RV1103, 64MB RAM — proved too tight for buffering multiple full-res frames) with a Waveshare SC3336
-camera module standing in for the IMX290 until the PCB exists.
+camera module standing in for the IMX290 until the PCB exists. **The Luckfox Pico board and the SC3336
+are both temporary prototyping stand-ins, not the production target** — production is the custom PCB
+(RV1106G3 + IMX290), not Luckfox hardware. The SC3336's known exposure ceiling is an accepted limitation
+for prototyping, not a bug to chase. Long term (low priority — not blocking current work), Luckfox-specific
+references/mechanisms should be phased out as the project moves onto the custom PCB; don't over-invest in
+Luckfox-board-specific tooling beyond what prototyping needs right now.
 
 Architectural decisions:
 - **Raw-only capture, no ISP.** Bypass rkaiq/rockit entirely — capture straight off the rkcif raw node
@@ -163,9 +168,12 @@ Mechanism (all additive, no shared vendor Makefiles touched — see the full pla
   CLI tools (htop/nano-adjacent/p7zip/iperf/socat/rsync/lrzsz/bmon/dialog/dtc/libdrm/freetype/evtest).
   Kept `libv4l`/`libv4l-utils`, `dhcpcd` (Ethernet), `bash`, `e2fsprogs` (load-bearing for first-boot
   rootfs resize in `S20linkmount`), `nano`.
-  **Caveat:** `sysdrv/source/buildroot/` is gitignored (whole vendor source trees are) — this edit lives
-  on disk but won't survive a fresh clone or a from-scratch source re-extraction; if that ever happens,
-  reapply from the plan file above.
+  **Persistence fixed (2026-09-15):** `sysdrv/source/buildroot/` is gitignored (whole vendor source
+  trees are), so this file didn't survive a fresh clone on its own. A tracked copy now lives at
+  `project/cfg/BoardConfig_IPC/luckfox_pico_defconfig`, and the board config (`BoardConfig-SD_CARD-...
+  -IPC.mk`) copies it into the gitignored vendor path itself every time `./build.sh` sources it (before
+  `__LINK_DEFCONFIG_FROM_BOARD_CFG` consumes it) — self-healing, verified by deleting the vendor copy and
+  confirming `./build.sh check` restored it. **Edit the tracked copy, not the vendor-tree one.**
 - Not touched (deliberately, to keep this low-risk): kernel Kconfig (ISP/RGA/MPP/NPU/audio drivers still
   *compile*, they're just never inserted — a further win is possible here but touches the kernel
   dependency graph) and `RK_APP_TYPE` (kept as `RKIPC_RV1103` since it's what wires up the SC3336/rkcif
@@ -174,32 +182,116 @@ Mechanism (all additive, no shared vendor Makefiles touched — see the full pla
   `dr_mode="peripheral"` in the DTS, already `RNDIS_EN=on`/`ADB_EN=on` in the stock `S50usbdevice`) is
   reserved for the future Alpaca HTTP server. WiFi kernel modules/firmware were kept (per project
   decision) even though unused today.
-- Not yet measured: actual boot-time-to-shell improvement and behavior on real hardware — the above is
-  build-verified (clean build, correct file deletions/overlays confirmed in the build log) but not yet
-  flashed/booted. Do that next, then re-run `grab.py` end-to-end to confirm the capture path.
+- **Hardware-verified (2026-09-15, via adb on the actual board):** `/dev/video0` and `/dev/v4l-subdev2`
+  present; `lsmod` shows exactly `phy_rockchip_csi2_dphy`, `phy_rockchip_csi2_dphy_hw`, `video_rkcif`,
+  `sc3336`, `rk_dvbm` — nothing else; no `rkipc`/`rockit`/`rkisp` process running; usb0 RNDIS up at
+  172.32.0.70; adb reachable. Matches the plan's intent exactly.
+
+**Partition layout for a 128MB target (done, verified 2026-09-15).** Stock `RK_PARTITION_CMD_IN_ENV` gave
+`userdata` 256M and `boot` 32M — the `userdata` allocation alone was 2x a 128MB SD card's total capacity,
+so the old table could never fit regardless of rootfs size. Shrunk to `boot=8M` (actual `boot.img` is only
+~3.7M) and `userdata=16M` (config/calibration only — `/tmp` is the RAM-backed scratch space, not
+userdata). Total flashable image (`sd_update.img`) is now **~69MB**, verified via a real
+`./build.sh firmware` run, comfortably inside even a conservative ~122MiB-usable 128MB card.
+
+**Boot speed: measured, and one hardware constraint discovered (2026-09-15).**
+- Real measured time, via a live `adb shell reboot` + polling for adb to come back: **~12.4s**, split into
+  ~7.2s before Linux's own `/proc/uptime` clock starts (BootROM + SPL/TPL + U-Boot + kernel decompression)
+  and ~5.2s of kernel + early userspace (rcS through `S50usbdevice` + USB gadget enumeration handshake).
+  More than half the time is in the pre-kernel phase, which none of the init-script trimming touches.
+- Fixed: `etc/init.d/S99usb0config` (now a no-op stub in `overlay-luckfox-astroguider`) was a leftover
+  Rockchip QA-harness script that force-assigned usb0 a *different* static IP (`.93`) than
+  `S50usbdevice` already sets (`.70`), guaranteeing a retry loop every boot.
+- Added `quiet` to `CONFIG_CMDLINE` in `sysdrv/source/kernel/arch/arm/configs/luckfox_rv1106_linux_defconfig`
+  (`CONFIG_CMDLINE_EXTEND=y`, so it appends rather than replaces) to cut serial-console printk overhead
+  during the kernel phase. **Build-verified only** — kernel rebuilds and the string is confirmed baked
+  into `vmlinux`/`zImage`, but not yet measured on hardware (see flashing constraint below).
+- Rockchip's "thunderboot" fast-boot infrastructure exists in this SDK's DTS tree
+  (`rv1106-thunder-boot-emmc.dtsi`, `rv1126-thunder-boot-spi-nor.dtsi`) and would likely be the biggest
+  remaining lever on the pre-kernel phase, but it's wired for eMMC/SPI-NOR only, not this SD_CARD config —
+  real candidate for the eventual RV1106G3/SPI-NAND retarget, not attempted here (kernel/DTS/U-Boot-level
+  work, same risk class as the Kconfig changes deferred above).
+- **Hardware constraint discovered:** this Luckfox Pico variant has **no onboard eMMC/NAND** — confirmed
+  via Rockchip's `upgrade_tool`: it detects an eMMC controller but `Flash Size: 0MB` (unpopulated). It's
+  SD-card-only. `upgrade_tool`'s rockusb protocol (reachable via `reboot(RESTART2, "loader")`, which maps
+  to `BOOT_BL_DOWNLOAD` via the `syscon-reboot-mode` DT node — confirmed working, gets the board into
+  Maskrom over USB with no physical button) only targets *internal* flash controllers, so **USB flashing
+  is not possible on this board**. Every image update requires physically pulling the SD card and
+  writing `output/image/sd_update.img` with `dd`/balenaEtcher from a PC.
 
 USB gadget/networking: **already wired, not "in progress" as previously noted here** — the DTS OTG node
 already has `dr_mode = "peripheral"` and the stock `S50usbdevice` configfs script already has
-`RNDIS_EN=on` and `ADB_EN=on` (usb0 comes up at a static IP via `run_binary()` in that script). What's
-still open: an on-device HTTP/Alpaca server to actually serve capture over that link — nothing built yet
-beyond the transport being ready. First milestone is `curl`/browser triggering a capture over usb0,
-replacing the adb-only workflow.
+`RNDIS_EN=on` and `ADB_EN=on` (usb0 comes up at a static IP via `run_binary()` in that script).
 
-PC-side tooling already written: `grab.py` (working capture/unpack/preview — sets sensor controls,
-captures N frames, pulls raw over adb/ssh, unpacks RAW10, writes PNG) plus diagnostic scripts from
-earlier exploration: `isp_grab.py`, `noise.py`, `bayer_phase.py`, `planes.py`, `period.py`, `bitorder.py`,
-`to_fits.py`.
+**Alpaca driver: working vertical slice, hardware-verified (2026-09-15).** Lives in `alpaca/` at the repo
+root — full design, module layout, and verification detail in `alpaca/README.md`; summary here. Runs
+*on the RV itself* (that's the point of Alpaca vs. classic ASCOM/COM), in C (no re-adding Python), using
+vendored CivetWeb (MIT, trimmed to ~760KB source) for HTTP. Discovery (UDP :32227), the management API,
+the common device API, and a full camera exposure cycle (`startexposure`→`imageready`→`imagearray`) all
+tested end-to-end against the real SC3336 via `adb forward`+`curl`: correct 1296×2304 output, valid
+10-bit pixel range, `ExposureMax`/`ExposureMin` computed live from V4L2 control ranges matching the
+project's independently-validated 27.45µs/row exactly (not hardcoded, so it tracks the exposure-ceiling
+investigation below automatically). A `sensor_desc_t` abstraction (`alpaca/src/sensor.h`) supports both
+color (Bayer) and monochrome sensors by design, with SC3336 fully populated and an IMX290 entry stubbed
+in as a TODO placeholder — adding a sensor is a new table entry, not new dispatch logic.
+`alpacad` is baked into the image itself (stripped binary + `S60alpacad` init script, both via the same
+`overlay-luckfox-astroguider` mechanism as the rest of the debloat work) — **reboot survival confirmed on
+real hardware** (physically reflashed, power-cycled, `ps` showed `alpacad` already running), not just
+build-verified.
+
+**Networking fixed: IPv4 link-local, not a fixed IP (2026-09-15).** The stock `S50usbdevice` hardcodes
+usb0 to `172.32.0.70/16`, which meant every connecting PC needed someone to manually assign a matching
+static IP — a real production problem, discovered the hard way (host-side interface names change every
+reconnect since the gadget's host MAC is randomized each boot). Fixed with a new `S51usb0-linklocal`
+script that just clears the static address and lets `dhcpcd` (already running) take over — it already
+correctly does DHCP-then-IPv4LL/RFC3927 fallback (confirmed via its own log), it was just racing with and
+losing to the static assignment. No new networking code needed. Verified stable on real hardware (settled
+on the same address twice, 5s apart). Windows/macOS/Linux all self-assign a compatible `169.254.0.0/16`
+address automatically for this, so production users need zero network configuration.
+
+**Build versioning added (2026-09-15).** `/etc/openastroguider-version` (build timestamp + git hash,
+`-dirty` if uncommitted) is now stamped into every build and exposed via the Alpaca `driverversion`
+endpoint — added after a real mixup where `./build.sh` (bare) archives a *new* dated snapshot into
+`IMAGE/*_RELEASE_TEST/` on every run without cleaning up old ones, making it easy to flash a stale one by
+habit. `./build.sh` itself was confirmed correct (byte-identical output to a manual step-by-step build);
+the dated-folder accumulation was the actual trap. Flash from `output/image/sd_update.img` directly to
+avoid it.
+
+**No imaging pipeline beyond raw capture, by design.** `alpacad` does raw capture → RAW10 unpack → serve
+via `imagearray` — no on-device dark/flat calibration, debayering, or stacking. Matches both this
+project's original architecture (raw frames shipped to the PC) and Alpaca's own design (camera driver
+hands back raw data, client does processing).
+
+**This board has no onboard eMMC/NAND and can't be flashed over USB** (confirmed via `upgrade_tool`) — use
+Rockchip SocToolKit's **SD Card** tab (writes a raw disk image to a physically-inserted card, same as
+`dd`), not the Download/Firmware tabs.
+
+**Not yet done:** tested against a real Alpaca client (`imagearray`'s row/column element ordering is
+implemented but explicitly unverified against the spec — `alpaca/test_client.py` using ASCOM's own
+`alpyca` library is ready to check this); real usb0 link re-tested with the *new* link-local addressing
+(verified with the old static IP, not yet re-checked since the networking fix); `ImageBytes` binary
+transfer (currently JSON-only; ~11.2MB JSON for a 5.97MB raw frame, measured).
+
+PC-side tooling: `grab.py` was the sensor-bringup/testing tool and **is no longer being maintained** —
+the project has moved on to the on-device Alpaca driver above; `grab.py` and its diagnostic siblings
+(`isp_grab.py`, `noise.py`, `bayer_phase.py`, `planes.py`, `period.py`, `bitorder.py`, `to_fits.py`) can
+be left to bit-rot.
 
 Working style for this project: prefer empirical validation over guessing (measure before cutting, use
 dark frames as ground truth); push back on unverified fixes offered as definitive — get the actual
 measurement or check.
 
-Open next steps: (1) flash the debloated image and verify boot time + `grab.py` capture path on real
-hardware (build-verified only so far); (2) push the SC3336 exposure ceiling as far as it goes — the
-go/no-go signal for long exposures; (3) minimal on-device HTTP/Alpaca server, first milestone `curl`
-working from a PC over the already-working usb0 RNDIS link; (4) optional follow-up: disable
-ISP/RGA/MPP/NPU/audio in kernel Kconfig too (they currently still compile, just aren't loaded) for a
-further flash-size cut; (5) separately, a custom SPI NAND board config for the 64–128MB deployment
-target (see the two candidate `.mk` files noted in earlier project notes) — not started, independent of
-the SD_CARD debloat above; (6) longer term, retarget the whole stack to RV1106G3 (256MB RAM) once
-validated on RV1103.
+Open next steps: (1) re-verify the real usb0 link now that addressing is link-local, not static, and test
+against a real Alpaca client or the ASCOM Conformance tool — in particular confirm `imagearray`'s
+row/column element ordering; (2) physically reflash with the current build (`output/image/sd_update.img`,
+not a dated `IMAGE/` snapshot) to measure the `quiet` bootarg's real effect and re-run the boot-time
+measurement — USB flashing isn't possible on this board (no onboard eMMC/NAND), use SocToolKit's SD Card
+tab; (3) push the SC3336
+exposure ceiling as far as it goes — the go/no-go signal for long exposures, and note the Alpaca driver's
+`ExposureMax` already tracks this automatically once it moves; (4) implement `ImageBytes` binary transfer
+in the Alpaca driver once real-client testing is underway (JSON `imagearray` is ~2x the raw payload size);
+(5) optional follow-up: disable ISP/RGA/MPP/NPU/audio in kernel Kconfig too (they currently still
+compile, just aren't loaded) for a further flash-size cut; (6) separately, a custom SPI NAND board
+config for the 64–128MB deployment target — not started, independent of the SD_CARD debloat above; this
+is also where Rockchip's thunderboot fast-boot feature becomes applicable; (7) longer term, retarget the
+whole stack to RV1106G3 (256MB RAM) once validated on RV1103.

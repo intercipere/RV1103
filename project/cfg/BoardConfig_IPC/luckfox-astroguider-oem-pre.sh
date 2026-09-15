@@ -4,6 +4,27 @@
 # Raw V4L2 capture only needs rkcif + the CSI2 PHY + the sensor driver in use;
 # everything below is dead weight from the stock RKIPC_RV1103 app bundle.
 
+function write_version() {
+    # OpenAstroGuider: stamp the exact build that produced this image into
+    # the rootfs itself, so "which build is actually on this SD card" is
+    # answerable by asking the device (adb, or the Alpaca API's
+    # driverversion field) instead of trusting which dated IMAGE/*_RELEASE_TEST
+    # folder you happened to flash from.
+    if [ -n "$RK_PROJECT_PACKAGE_ROOTFS_DIR" ]; then
+        local git_rev
+        git_rev=$(git -C "$SDK_ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)
+        if [ -n "$(git -C "$SDK_ROOT_DIR" status --porcelain 2>/dev/null)" ]; then
+            git_rev="${git_rev}-dirty"
+        fi
+        mkdir -p "$RK_PROJECT_PACKAGE_ROOTFS_DIR/etc"
+        echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ) git=$git_rev" \
+            >"$RK_PROJECT_PACKAGE_ROOTFS_DIR/etc/openastroguider-version"
+        echo "Wrote version file: $(cat "$RK_PROJECT_PACKAGE_ROOTFS_DIR/etc/openastroguider-version")"
+    else
+        echo "write_version: RK_PROJECT_PACKAGE_ROOTFS_DIR not set, skipping"
+    fi
+}
+
 function lf_rm() {
     for file in "$@"; do
         if [ -e "$file" ]; then
@@ -102,3 +123,4 @@ function remove_data()
 # run
 #=========================
 remove_data
+write_version
