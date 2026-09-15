@@ -158,7 +158,29 @@ static int h_startexposure(struct mg_connection *conn, params_t *params,
  * NOTE: row-major [row][col] nesting is what's implemented here; the exact
  * element ordering the Alpaca spec requires has NOT been independently
  * re-verified against the API Reference PDF or a real client (e.g. the
- * ASCOM Conformance tool) -- treat this as unverified until checked. */
+ * ASCOM Conformance tool) -- treat this as unverified until checked.
+ *
+ * Two-pass: first pass counts the exact output byte length with cheap
+ * integer digit-counting (no allocation, no formatting), then a second
+ * pass streams the actual content through a small fixed chunk buffer after
+ * declaring that exact Content-Length. This gives a real, correct
+ * Content-Length (some strict HTTP client libraries -- e.g. .NET
+ * HttpClient, which real Alpaca clients like N.I.N.A. are often built on
+ * -- are picky about a response with none) *without* ever holding the
+ * ~11MB response in memory at once. That matters a lot here: this device
+ * has only ~32MB total RAM (as little as 2MB free was observed under
+ * load), not the 64MB assumed earlier -- an initial version of this
+ * function that buffered the whole response in one malloc'd block OOM'd
+ * and crash-rebooted the board during testing. Don't reintroduce that. */
+static int udigits(unsigned v) {
+	int n = 1;
+	while (v >= 10) {
+		v /= 10;
+		n++;
+	}
+	return n;
+}
+
 static void send_imagearray(struct mg_connection *conn, long client_txn_id) {
 	pthread_mutex_lock(&g_device.lock);
 	if (!g_device.image_ready || g_device.last_frame.pixels == NULL) {
@@ -173,14 +195,28 @@ static void send_imagearray(struct mg_connection *conn, long client_txn_id) {
 	int w = g_device.last_frame.width, h = g_device.last_frame.height;
 	uint16_t *pixels = g_device.last_frame.pixels;
 
-	mg_printf(conn,
-	          "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-	          "Connection: close\r\n\r\n");
+	char tail[64];
+	int tail_len = snprintf(tail, sizeof(tail),
+	                         "],\"ClientTransactionID\":%ld,\"ErrorNumber\":0,"
+	                         "\"ErrorMessage\":\"\"}",
+	                         client_txn_id);
 
+	/* Pass 1: exact length, no allocation. */
+	size_t total = strlen("{\"Value\":[");
+	for (int y = 0; y < h; y++) {
+		total += (y ? 1 : 0) + 1; /* leading comma (if any) + '[' */
+		for (int x = 0; x < w; x++)
+			total += (x ? 1 : 0) + (size_t)udigits(pixels[(size_t)y * w + x]);
+		total += 1; /* ']' */
+	}
+	total += (size_t)tail_len;
+
+	mg_send_http_ok(conn, "application/json", (long long)total);
+
+	/* Pass 2: stream through a small fixed buffer. */
 	char chunk[8192];
 	size_t pos = 0;
 	pos += (size_t)snprintf(chunk + pos, sizeof(chunk) - pos, "{\"Value\":[");
-
 	for (int y = 0; y < h; y++) {
 		if (y) chunk[pos++] = ',';
 		chunk[pos++] = '[';
@@ -199,10 +235,8 @@ static void send_imagearray(struct mg_connection *conn, long client_txn_id) {
 			pos = 0;
 		}
 	}
-	pos += (size_t)snprintf(chunk + pos, sizeof(chunk) - pos,
-	                         "],\"ClientTransactionID\":%ld,\"ErrorNumber\":0,"
-	                         "\"ErrorMessage\":\"\"}",
-	                         client_txn_id);
+	memcpy(chunk + pos, tail, (size_t)tail_len);
+	pos += (size_t)tail_len;
 	mg_write(conn, chunk, pos);
 
 	pthread_mutex_unlock(&g_device.lock);
@@ -323,6 +357,31 @@ static int camera_dispatch(struct mg_connection *conn, void *cbdata) {
 		/* Binning isn't implemented -- fixed at 1, deliberately out of
 		 * scope for this first version (see README.md). */
 		alpaca_response_int(buf, sizeof(buf), 1, client_txn_id);
+		send_json(conn, buf);
+		return 200;
+	}
+	if (strcasecmp(member, "startx") == 0 || strcasecmp(member, "starty") == 0 ||
+	    strcasecmp(member, "numx") == 0 || strcasecmp(member, "numy") == 0) {
+		/* Accepted/stored/reported for client compatibility -- real
+		 * capture always returns the full sensor frame (V4L2 cropping
+		 * isn't implemented), see device_state.h. Many Alpaca clients
+		 * (N.I.N.A. included) PUT NumX/NumY to the full frame size before
+		 * every exposure and abort if that PUT isn't implemented. */
+		long *field = strcasecmp(member, "startx") == 0   ? &g_device.start_x
+		              : strcasecmp(member, "starty") == 0 ? &g_device.start_y
+		              : strcasecmp(member, "numx") == 0    ? &g_device.num_x
+		                                                    : &g_device.num_y;
+		if (strcasecmp(ri->request_method, "PUT") == 0) {
+			pthread_mutex_lock(&g_device.lock);
+			*field = params_get_int(&params, member, *field);
+			pthread_mutex_unlock(&g_device.lock);
+			alpaca_response(buf, sizeof(buf), NULL, client_txn_id, 0, "");
+		} else {
+			pthread_mutex_lock(&g_device.lock);
+			long v = *field;
+			pthread_mutex_unlock(&g_device.lock);
+			alpaca_response_int(buf, sizeof(buf), v, client_txn_id);
+		}
 		send_json(conn, buf);
 		return 200;
 	}

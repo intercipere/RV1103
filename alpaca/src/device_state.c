@@ -9,4 +9,8 @@ void device_state_init(void) {
 	g_device.sensor = sensor_detect();
 	g_device.state = CAM_IDLE;
 	g_device.gain = 128; /* 1x, matches the subdev's reported default */
+	g_device.start_x = 0;
+	g_device.start_y = 0;
+	g_device.num_x = g_device.sensor->width;
+	g_device.num_y = g_device.sensor->height;
 }

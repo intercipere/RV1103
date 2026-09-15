@@ -114,7 +114,9 @@ This clone (`https://github.com/intercipere/RV1103`, forked from `LuckfoxTECH/lu
 adapted into a custom astronomy guide camera: a mono IMX290 sensor on a custom PCB around a Rockchip
 RV1106G3 SoC (256MB RAM), replacing an off-the-shelf colour IMX290 USB module capped at 0.5s exposures.
 Goal is long exposures without relying on PHD2 live stacking. Current prototyping platform is the Luckfox
-Pico (RV1103, 64MB RAM — proved too tight for buffering multiple full-res frames) with a Waveshare SC3336
+Pico (RV1103, **~32MB RAM as reported by Linux** — `MemTotal` is 32588kB, not the 64MB assumed earlier;
+corrected 2026-09-15 after a real OOM crash during Alpaca driver testing, see below — proved too tight
+for buffering multiple full-res frames) with a Waveshare SC3336
 camera module standing in for the IMX290 until the PCB exists. **The Luckfox Pico board and the SC3336
 are both temporary prototyping stand-ins, not the production target** — production is the custom PCB
 (RV1106G3 + IMX290), not Luckfox hardware. The SC3336's known exposure ceiling is an accepted limitation
@@ -138,7 +140,7 @@ Validated sensor/driver facts (empirical, not from docs — trust these over dat
   little-endian bit assembly within each pixel's 10 bits** (`np.unpackbits(..., bitorder="little")`,
   ascending powers of two). Big-endian assumptions produce pixel-scrambled noise that looks identical
   across all four Bayer phases — that's the signature of this specific bug, not a phase-offset bug.
-- `/tmp` on the board is a RAM disk on a 64MB device — multi-frame captures must be pulled off-device in
+- `/tmp` on the board is a RAM disk on a ~32MB device (see corrected figure above) — multi-frame captures must be pulled off-device in
   batches, never buffered fully on-device.
 - SC3336 shares IMX290's architecture: exposure capped by frame length, driver likely enforces a
   `vblank` ceiling below what the silicon allows. Pushing that ceiling on the SC3336 is the concrete
@@ -266,11 +268,28 @@ hands back raw data, client does processing).
 Rockchip SocToolKit's **SD Card** tab (writes a raw disk image to a physically-inserted card, same as
 `dd`), not the Download/Firmware tabs.
 
-**Not yet done:** tested against a real Alpaca client (`imagearray`'s row/column element ordering is
-implemented but explicitly unverified against the spec — `alpaca/test_client.py` using ASCOM's own
-`alpyca` library is ready to check this); real usb0 link re-tested with the *new* link-local addressing
-(verified with the old static IP, not yet re-checked since the networking fix); `ImageBytes` binary
-transfer (currently JSON-only; ~11.2MB JSON for a 5.97MB raw frame, measured).
+**Real Windows/N.I.N.A. testing found and fixed two bugs (2026-09-15):**
+1. `StartX`/`StartY`/`NumX`/`NumY` weren't implemented at all — real Alpaca clients (unlike my own `curl`
+   testing) PUT `NumX`/`NumY` to the full frame size before *every* exposure, even a full-frame one, and
+   abort if that PUT errors. Now accepted/stored/reported (real cropping still not implemented — capture
+   always returns the full sensor frame regardless of what's requested).
+2. `imagearray` originally streamed with `Connection: close` and no `Content-Length`, and a first attempt
+   at fixing that by buffering the whole ~11MB response in one `malloc` **OOM'd and crash-rebooted the
+   board** — this is where the 32MB (not 64MB) RAM figure above was actually discovered. Fixed properly
+   with a two-pass approach: count the exact byte length first (cheap, no allocation), then stream through
+   a small fixed buffer after declaring that exact `Content-Length`. Verified: correct `Content-Length`
+   header matching actual bytes sent, memory flat before/after (no growth), valid 1296×2304 JSON output.
+
+Confirmed working end-to-end from Windows: N.I.N.A.'s (or similar) Alpaca autodiscover found the device
+correctly as "OpenAstroGuider Camera" at a self-assigned `169.254.x.x:11111#0` address — validates the
+link-local networking fix over the real link, not just `adb forward`. Discovery currently takes ~15-20s
+from plugging in (not yet investigated — likely IPv4LL's probe/announce timing, RFC 3927 allows up to
+~9s of probing alone before even attempting to bind).
+
+**Not yet done:** tested against the ASCOM Conformance tool (`imagearray`'s row/column element ordering
+is implemented but not independently re-verified against the spec PDF); `ImageBytes` binary transfer
+(currently JSON-only; ~11.2MB JSON for a 5.97MB raw frame, measured); investigate the 15-20s discovery
+delay.
 
 PC-side tooling: `grab.py` was the sensor-bringup/testing tool and **is no longer being maintained** —
 the project has moved on to the on-device Alpaca driver above; `grab.py` and its diagnostic siblings

@@ -238,20 +238,51 @@ repo `CLAUDE.md`) and can't be reflashed over USB — needs a physical SD card s
 rebuild+reflash after any further `alpacad` source change; the overlay copies whatever binary is at that
 path at build time, it doesn't rebuild it for you.
 
-## Known gaps / not yet done
+## Real hardware has ~32MB RAM, not 64MB (corrected 2026-09-15)
 
-- **Reboot survival: verified.** Real usb0 link: verified with the *old* static-IP scheme (browser/`curl`
-  worked over an actual host route, not just `adb forward`) — **not yet re-verified with the new
-  link-local addressing** (built and tested via a live-patched script on the running device, not yet
-  through a full reflash + fresh connection from a browser).
-- **Not tested against a real Alpaca client** (N.I.N.A., PHD2, or the ASCOM Conformance Universal tool).
+`MemTotal` is 32588kB per `/proc/meminfo`, not the 64MB assumed throughout earlier design discussion.
+This was discovered the hard way: an initial fix for `imagearray`'s missing `Content-Length` (see below)
+buffered the whole ~11MB response in one `malloc`, which **OOM'd and crash-rebooted the board** during
+testing (confirmed via `adb devices` showing repeated re-enumeration, then `uptime` showing a fresh boot).
+Available RAM was observed as low as ~2MB free under load. **Any future code touching a full-frame buffer
+needs to budget against ~32MB total, not 64MB, and should stream rather than buffer whenever the data
+scales with frame size.**
+
+## Real client testing (Windows + N.I.N.A. or similar, 2026-09-15): two bugs found and fixed
+
+Alpaca autodiscover from a Windows PC found the device correctly ("OpenAstroGuider Camera" at a
+self-assigned `169.254.x.x:11111#0`) — validates the link-local networking fix over the real link, not
+just `adb forward`. Takes ~15-20s from plugging in to being discovered; not yet investigated (likely
+IPv4LL probe/announce timing — RFC 3927 allows up to ~9s of ARP probing alone). Connecting worked, but
+starting an exposure errored out. Two real bugs, both fixed and verified on hardware:
+
+1. **`StartX`/`StartY`/`NumX`/`NumY` weren't implemented at all.** My own `curl`-based testing never
+   exercised these, but real Alpaca clients (N.I.N.A. included) `PUT` `NumX`/`NumY` to the full frame size
+   before *every* exposure, even a full-frame one, and abort if that `PUT` returns "Not implemented."
+   Fixed: `device_state_t` now carries `start_x`/`start_y`/`num_x`/`num_y`, accepted/stored/reported via
+   GET/PUT. Real cropping still isn't implemented — capture always returns the full sensor frame
+   regardless of what's requested, which is honest for the common case (guide cameras capturing full
+   frame) but would mislead a client that actually wants a genuine subframe.
+2. **`imagearray` streamed with `Connection: close` and no `Content-Length`**, which strict HTTP client
+   libraries (e.g. .NET `HttpClient`, likely what N.I.N.A. uses internally) can be picky about. Fixed
+   with a two-pass approach in `send_imagearray()`: pass 1 counts the exact output byte length with cheap
+   integer digit-counting (no allocation), pass 2 streams the actual content through a small fixed 8KB
+   buffer after declaring that exact `Content-Length`. Verified: `Content-Length` header matches
+   `curl`'s actual downloaded size exactly, memory flat before/after (no growth, unlike the crash-inducing
+   full-buffer attempt above), valid 1296×2304 JSON output.
+
+- **Not tested against the ASCOM Conformance Universal tool.**
   In particular, **`imagearray`'s row/column element ordering has not been independently verified against
   the ASCOM Alpaca API Reference PDF** — `camera_api.c`'s `send_imagearray()` emits row-major `[row][col]`
   nesting, flagged in-code as unverified. This is exactly the kind of convention that's easy to get
   backwards and easy to verify with a real client, so don't trust it silently.
 - **`ImageBytes` binary transfer not implemented** — `imagearray` is JSON-only today. A real captured
   frame serializes to ~11.2MB of JSON (measured) for a 5.97MB raw uint16 payload — roughly 2x overhead
-  from ASCII digits/commas. Worth doing once real-client testing is underway.
+  from ASCII digits/commas. Worth doing now that real-client testing is underway, given the JSON path's
+  size is a real concern on a ~32MB device (see above), not just a bandwidth nicety.
+
+## Known gaps / not yet done
+
 - **No mid-capture cancellation.** `stopexposure`/`abortexposure` reset the reported state but the
   in-flight V4L2 `DQBUF` call still runs to completion in its worker thread; its result still lands in
   `last_frame` when done. Fine for now (captures are sub-second), would matter for longer exposures.
