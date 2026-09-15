@@ -24,11 +24,30 @@ typedef struct {
 } v4l2_frame_t;
 
 /*
- * Captures a single frame from desc->video_path using the multiplanar
- * capture API (confirmed required for the rkcif driver via
- * `v4l2-ctl --list-formats-ext`: "Video Capture Multiplanar"), unpacks it
- * via desc->unpack, and fills `out`. Returns 0 on success, -1 on error.
+ * Opens desc->video_path, allocates a single mmap'd buffer, and starts
+ * streaming -- once, kept open across exposures instead of reopened per
+ * capture (see alpaca/README.md, "Persistent V4L2 device"). Must be called
+ * once before any v4l2_capture_frame() call. Returns 0 on success, -1 on
+ * error.
  */
-int v4l2_capture_frame(const sensor_desc_t *desc, v4l2_frame_t *out);
+int v4l2_capture_init(const sensor_desc_t *desc);
+
+/*
+ * Stops streaming and releases the buffer/fd. Not called anywhere in the
+ * daemon's normal lifecycle (it's killed and restarted wholesale via
+ * S60alpacad); provided for symmetry and for test_capture.c.
+ */
+void v4l2_capture_shutdown(void);
+
+/*
+ * Captures one frame reflecting the caller's most recent v4l2_ctrl_set()
+ * calls, discarding whatever the driver already had queued from before
+ * those calls (necessary because streaming never stops between exposures --
+ * see the .c file). Pass extra_settle=1 if this call just changed
+ * vertical_blanking; a plain gain/exposure change doesn't need it (see
+ * alpaca/README.md, "Persistent V4L2 device"). Returns 0 on success, -1 on
+ * error (including if v4l2_capture_init() wasn't called or failed).
+ */
+int v4l2_capture_frame(v4l2_frame_t *out, int extra_settle);
 
 #endif

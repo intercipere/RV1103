@@ -8,8 +8,20 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 #include <linux/videodev2.h>
+
+/* Per-stage timing for v4l2_capture_frame(), to find out precisely which V4L2
+ * ioctl the observed ~650ms fixed floor (independent of actual exposure
+ * duration) is actually in, rather than guessing. Mirrors camera_api.c's
+ * now_ms() helper (not shared, to avoid a cross-file dependency for a few
+ * lines of diagnostic code). */
+static double now_ms(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
 
 /* The kernel reports control names in human-readable form ("Exposure",
  * "Analogue Gain"); v4l2-ctl (and this project's sensor.h ctrl_* names,
@@ -108,9 +120,35 @@ int v4l2_ctrl_get_range(const char *subdev_path, const char *name,
 	return 0;
 }
 
-#define NUM_BUFFERS 4
+/* Persistent capture state, set up once by v4l2_capture_init() and reused by
+ * every v4l2_capture_frame() call -- see v4l2_capture.h for why a single
+ * buffer (not the old NUM_BUFFERS=4 pool) is sufficient and in fact what
+ * makes the discard-then-capture correctness argument in
+ * v4l2_capture_frame() straightforward: at most one buffer is ever in
+ * flight, so there is no ambiguity about which completed buffer is "the
+ * stale one" vs. "the fresh one". */
+static int g_fd = -1;
+static const sensor_desc_t *g_desc;
+static void *g_buf;
+static __u32 g_buf_length;
+static __u32 g_stride;
 
-int v4l2_capture_frame(const sensor_desc_t *desc, v4l2_frame_t *out) {
+static void teardown_locked(void) {
+	if (g_fd < 0)
+		return;
+	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	ioctl(g_fd, VIDIOC_STREAMOFF, &type);
+	if (g_buf)
+		munmap(g_buf, g_buf_length);
+	close(g_fd);
+	g_fd = -1;
+	g_buf = NULL;
+}
+
+int v4l2_capture_init(const sensor_desc_t *desc) {
+	if (g_fd >= 0)
+		teardown_locked();
+
 	int fd = open(desc->video_path, O_RDWR);
 	if (fd < 0)
 		return -1;
@@ -128,11 +166,10 @@ int v4l2_capture_frame(const sensor_desc_t *desc, v4l2_frame_t *out) {
 		return -1;
 	}
 	__u32 stride = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
-	__u32 planesize = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
 
 	struct v4l2_requestbuffers req;
 	memset(&req, 0, sizeof(req));
-	req.count = NUM_BUFFERS;
+	req.count = 1;
 	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	req.memory = V4L2_MEMORY_MMAP;
 	if (ioctl(fd, VIDIOC_REQBUFS, &req) < 0 || req.count < 1) {
@@ -140,37 +177,64 @@ int v4l2_capture_frame(const sensor_desc_t *desc, v4l2_frame_t *out) {
 		return -1;
 	}
 
-	void *bufs[NUM_BUFFERS] = {0};
-	__u32 buf_lengths[NUM_BUFFERS] = {0};
-	unsigned nbufs = req.count;
-
-	for (unsigned i = 0; i < nbufs; i++) {
-		struct v4l2_plane plane;
-		struct v4l2_buffer buf;
-		memset(&plane, 0, sizeof(plane));
-		memset(&buf, 0, sizeof(buf));
-		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-		buf.memory = V4L2_MEMORY_MMAP;
-		buf.index = i;
-		buf.m.planes = &plane;
-		buf.length = 1;
-		if (ioctl(fd, VIDIOC_QUERYBUF, &buf) < 0)
-			goto fail_unmap;
-		bufs[i] = mmap(NULL, plane.length, PROT_READ | PROT_WRITE, MAP_SHARED,
-		               fd, plane.m.mem_offset);
-		if (bufs[i] == MAP_FAILED) {
-			bufs[i] = NULL;
-			goto fail_unmap;
-		}
-		buf_lengths[i] = plane.length;
-		if (ioctl(fd, VIDIOC_QBUF, &buf) < 0)
-			goto fail_unmap;
+	struct v4l2_plane plane;
+	struct v4l2_buffer buf;
+	memset(&plane, 0, sizeof(plane));
+	memset(&buf, 0, sizeof(buf));
+	buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	buf.memory = V4L2_MEMORY_MMAP;
+	buf.index = 0;
+	buf.m.planes = &plane;
+	buf.length = 1;
+	if (ioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
+		close(fd);
+		return -1;
+	}
+	void *bufptr = mmap(NULL, plane.length, PROT_READ | PROT_WRITE, MAP_SHARED,
+	                     fd, plane.m.mem_offset);
+	if (bufptr == MAP_FAILED) {
+		close(fd);
+		return -1;
+	}
+	if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+		munmap(bufptr, plane.length);
+		close(fd);
+		return -1;
 	}
 
 	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-	if (ioctl(fd, VIDIOC_STREAMON, &type) < 0)
-		goto fail_unmap;
+	if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+		munmap(bufptr, plane.length);
+		close(fd);
+		return -1;
+	}
 
+	g_fd = fd;
+	g_desc = desc;
+	g_buf = bufptr;
+	g_buf_length = plane.length;
+	g_stride = stride;
+
+	/* First capture after STREAMON can still reflect pre-streaming defaults
+	 * (confirmed on real hardware) -- absorb that here, before the HTTP
+	 * server starts, so no client ever sees it. */
+	v4l2_frame_t warmup;
+	if (v4l2_capture_frame(&warmup, 0) != 0) {
+		teardown_locked();
+		return -1;
+	}
+	free(warmup.pixels);
+	return 0;
+}
+
+void v4l2_capture_shutdown(void) {
+	teardown_locked();
+}
+
+/* Dequeues buffer 0 (blocking) and immediately requeues it. Used both to
+ * discard a stale frame and, after unpacking, to re-arm the buffer for the
+ * next call. */
+static int dqbuf_requeue(int requeue) {
 	struct v4l2_plane plane;
 	struct v4l2_buffer buf;
 	memset(&plane, 0, sizeof(plane));
@@ -179,33 +243,70 @@ int v4l2_capture_frame(const sensor_desc_t *desc, v4l2_frame_t *out) {
 	buf.memory = V4L2_MEMORY_MMAP;
 	buf.m.planes = &plane;
 	buf.length = 1;
-	if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
-		ioctl(fd, VIDIOC_STREAMOFF, &type);
-		goto fail_unmap;
-	}
-
-	out->width = desc->width;
-	out->height = desc->height;
-	out->pixels = malloc((size_t)desc->width * desc->height * sizeof(uint16_t));
-	if (out->pixels == NULL) {
-		ioctl(fd, VIDIOC_STREAMOFF, &type);
-		goto fail_unmap;
-	}
-	desc->unpack((const uint8_t *)bufs[buf.index], (int)stride, desc->width,
-	             desc->height, out->pixels);
-
-	ioctl(fd, VIDIOC_STREAMOFF, &type);
-	for (unsigned i = 0; i < nbufs; i++)
-		if (bufs[i])
-			munmap(bufs[i], buf_lengths[i]);
-	close(fd);
-	(void)planesize;
+	if (ioctl(g_fd, VIDIOC_DQBUF, &buf) < 0)
+		return -1;
+	if (requeue && ioctl(g_fd, VIDIOC_QBUF, &buf) < 0)
+		return -1;
 	return 0;
+}
 
-fail_unmap:
-	for (unsigned i = 0; i < nbufs; i++)
-		if (bufs[i])
-			munmap(bufs[i], buf_lengths[i]);
-	close(fd);
-	return -1;
+int v4l2_capture_frame(v4l2_frame_t *out, int extra_settle) {
+	if (g_fd < 0)
+		return -1;
+
+	double t0 = now_ms();
+	/* Discard whatever the driver already had ready, then requeue -- the
+	 * driver can't start its next capture before that requeue, which
+	 * happens after the caller's v4l2_ctrl_set() calls. A second round is
+	 * needed when vertical_blanking (frame period, not just an integration
+	 * value) just changed -- see v4l2_capture.h. */
+	if (dqbuf_requeue(1) != 0)
+		return -1;
+	if (extra_settle && dqbuf_requeue(1) != 0)
+		return -1;
+	double t_discard = now_ms();
+
+	/* This is the frame whose capture window began at or after the requeue
+	 * above -- guaranteed fresh regardless of whether this sensor latches
+	 * new exposure/gain at the very next frame or one frame later. Don't
+	 * requeue yet: the buffer must stay mapped and untouched by the driver
+	 * until unpack() below has copied its contents out. */
+	if (dqbuf_requeue(0) != 0)
+		return -1;
+	double t_dqbuf = now_ms();
+
+	out->width = g_desc->width;
+	out->height = g_desc->height;
+	out->pixels =
+	    malloc((size_t)g_desc->width * g_desc->height * sizeof(uint16_t));
+	if (out->pixels == NULL)
+		return -1;
+	g_desc->unpack((const uint8_t *)g_buf, (int)g_stride, g_desc->width,
+	               g_desc->height, out->pixels);
+	double t_unpack = now_ms();
+
+	/* Re-arm for the next call's discard step, keeping the driver capturing
+	 * continuously in the background between exposures. */
+	struct v4l2_plane plane;
+	struct v4l2_buffer buf;
+	memset(&plane, 0, sizeof(plane));
+	memset(&buf, 0, sizeof(buf));
+	buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	buf.memory = V4L2_MEMORY_MMAP;
+	buf.index = 0;
+	buf.m.planes = &plane;
+	buf.length = 1;
+	if (ioctl(g_fd, VIDIOC_QBUF, &buf) < 0) {
+		free(out->pixels);
+		out->pixels = NULL;
+		return -1;
+	}
+	double t_requeue = now_ms();
+
+	fprintf(stderr,
+	        "[v4l2] discard=%.0f dqbuf=%.0f unpack=%.0f requeue=%.0f "
+	        "total=%.0f\n",
+	        t_discard - t0, t_dqbuf - t_discard, t_unpack - t_dqbuf,
+	        t_requeue - t_unpack, t_requeue - t0);
+	return 0;
 }

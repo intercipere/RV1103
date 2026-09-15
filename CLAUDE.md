@@ -309,9 +309,137 @@ the old ~6-10s JSON fetch, PHD2 could have been displaying a stale frame while a
 had already completed — a symptom of the slow-fetch bug, not a separate one. Resolved once ImageBytes
 dropped fetch time to ~0.7s.
 
-**Not yet done:** tested against the ASCOM Conformance tool; investigate the 15-20s discovery delay
-(likely IPv4LL probe/announce timing, RFC 3927 allows ~9s of probing alone); diagnose PHD2's
-duration-not-applied symptom from the client side, now that the server side is proven correct.
+**SharpCap black image + N.I.N.A. total failure, same root cause, found and fixed.** N.I.N.A. gave a
+precise error: `The JSON value could not be converted to System.Int16 ... BytePositionInLine: 14`, which
+lands exactly on our `gainmax` value (99614, the raw V4L2 `analogue_gain` max) in a `{"Value":99614,...}`
+response. **ASCOM types `Gain`/`GainMin`/`GainMax` as `Int16`** (max 32767) — 99614 blows past that.
+Likely explains SharpCap too: if it can't parse a valid gain range either, it may default to an unusable
+gain (e.g. 0, below our real minimum of 128 = 1x) and produce black frames regardless of exposure. Fixed
+by translating `gain`/`gainmin`/`gainmax` to/from a fixed `Int16`-safe ASCOM-facing scale (`0..1000`) at
+the API boundary, keeping the raw value internal.
+
+**That alone didn't fix SharpCap.** N.I.N.A. connected afterward but still black; added request/exposure
+logging to `alpacad` to see real client traffic (had to fix a stdio-buffering bug first — `stderr` is
+block-buffered once redirected to a file, so log lines never reached disk until `setvbuf(..., _IONBF, 0)`
+was added to `main()`). The captured SharpCap log showed the server working *correctly* the whole time —
+every exposure's requested/applied hardware values matched exactly, and captured data was genuinely valid.
+The real bug: SharpCap's normal gain-calibration sweep reached ASCOM gain ≈898/1000, which our then-linear
+mapping across the sensor's full native range (128..99614 raw, ~1x..~778x) translated to raw gain ~89466
+(~700x) — saturating badly, so SharpCap compensated with a ~2ms exposure that reads out as pure noise floor
+at that gain (indistinguishable from black). Fixed by capping the ASCOM-exposed gain range to a practical
+32x ceiling instead of the sensor's full ~778x range — a guide camera has no real use for gain that high,
+it just amplifies noise. Re-verified the exact scenario from the log now maps to ~28.8x instead of ~700x.
+**Correction: the gain theory was wrong.** Asked directly whether the very first exposure (mean=472.5,
+well-exposed, gain untouched) also displayed black — yes, **every image was identically flat black, "not
+even noisy, just black."** That rules out an exposure/gain data problem entirely (real underexposed data
+still shows read noise); it points to something structurally broken in how the client decodes the
+response, not what's in it. The gain-scale cap stays in (independently correct), but it wasn't the fix.
+Also retracted the "SharpCap auto-calibrates toward a brightness target" claim — the gain-sweep sequence
+starts *while a previous exposure is still capturing*, not after examining its result, so that was
+overconfident inference, not a verified mechanism. Forced JSON-only and retested: SharpCap gave a precise
+error instead — `image array element type Unknown is not supported (0x8004040b)`. **Real root cause
+found**: read an independent, open-source Alpaca server implementation
+(`github.com/mikefsq/goalpaca/server/imagearray.go`) and found two concrete bugs. (1) Our JSON response
+was missing the required `"Type"`/`"Rank"` fields entirely (`{"Type":<n>,"Rank":<n>,"Value":[...],...}` —
+SharpCap reads the missing `Type` as its zero-default `Unknown`). (2) **The array dimension order was
+backwards in both JSON and `ImageBytes`** — the correct wire convention is `[Width][Height]` with X as the
+*outer* index (`Value[x][y] = Pixels[y*Width+x]`), not row-major as previously claimed. That earlier claim
+was based on alpyca's client-side reshape code, which just mirrors whatever dimensions a server sends
+without validating against spec — and pixel statistics (min/max/mean) are transposition-invariant, so
+nothing caught this until an independent reference implementation was checked directly. Likely also
+explains the *original* `ImageBytes` black-image symptom: wrong dimension order silently failing
+SharpCap's own documented strict frame-validation. Both fixed in `camera_api.c`; loop logic verified
+structurally correct via a small hand-traceable host-side test (board unreachable from this machine at fix
+time). **Not yet verified on real hardware or a real client session** — meaningfully higher confidence
+than the two earlier wrong theories (grounded in an independent authoritative implementation, not log
+inference), but still needs a real retest.
+
+**Not yet done:** retest SharpCap/N.I.N.A. with this fix (the real test); tested against the ASCOM Conformance tool;
+investigate the 15-20s discovery delay (likely IPv4LL probe/announce timing, RFC 3927 allows ~9s of
+probing alone).
+
+**Real per-frame latency measured precisely, two fixed root causes found (2026-09-15).** User reported
+0.1s PHD2 exposures still coming in slow. Added `CLOCK_MONOTONIC` timing to every V4L2 ioctl stage and
+split the `imagebytes` send into pack-vs-write time rather than guessing. Found two large, *fixed* costs,
+almost totally independent of the requested exposure duration — full numbers and analysis in
+`alpaca/README.md`, "Real per-frame latency measured precisely":
+1. `v4l2_capture_frame()` opens/closes `/dev/video0` on every single exposure, and the `STREAMOFF`+
+   `munmap`+`close` teardown alone costs ~515-523ms every time — confirmed via direct measurement (not the
+   earlier guessed "hardware pipeline warm-up" theory, which only actually applies to the very first
+   capture after daemon start). A 1.1ms sensor exposure still took 643ms total.
+2. `send_imagebytes()`'s ~1.3s send time is **CPU-bound, not network-bound**: the transposed pixel-pack
+   loop (needed for the `[Width][Height]` wire order fixed earlier this session) takes ~1078ms of it, while
+   the actual `mg_write()` network transfer is only ~250ms (~23MB/s, a normal RNDIS rate). Classic
+   stride-based cache-miss pattern, not a bandwidth problem.
+
+Combined fixed floor was ~2 seconds per frame regardless of exposure duration. Two independent fixes
+identified; the first is now implemented (below), the second — a cache-blocked transpose (or native
+wire-order internal storage) instead of the naive stride-w copy in `send_imagebytes()` — is still open.
+
+**Persistent V4L2 device: implemented and hardware-verified, two real settling bugs found and fixed
+(2026-09-15).** `v4l2_capture_frame()` no longer opens/closes `/dev/video0` per exposure. Split into
+`v4l2_capture_init()` (open, format, allocate one mmap'd buffer, `STREAMON` — called once at daemon
+startup in `main()`, right after sensor detection; daemon exits if it fails) and `v4l2_capture_frame()`
+(now takes no sensor argument, reuses the buffer set up by `_init`). Deliberately kept to a **single**
+buffer, not the old 4-buffer pool — with the driver only ever holding one frame in flight, the correctness
+argument for continuous streaming stays simple: dequeue-and-requeue whatever's already ready (discarded),
+then dequeue again for the frame that actually reflects the caller's just-applied controls.
+
+On real hardware this needed **two** settling fixes, both confirmed via reboot + controlled testing
+(alternating dim/bright exposure requests, reading the existing `requested ... -> applied ...` /
+`captured min/max/mean` log lines — not just trusting the log's control readback, which was exactly what
+was misleading before this was checked): (1) the very first exposure after daemon startup could return a
+stale/wrong frame — fixed with a throwaway discard-and-capture cycle inside `v4l2_capture_init()` itself,
+before the HTTP server starts; (2) the first request in a session that raises `vertical_blanking`
+(exposure_worker() does this when the requested exposure exceeds the sensor's frame-length ceiling — see
+"Validated sensor/driver facts" above) also came back stale, since changing the frame period evidently
+needs more settling than a plain gain/exposure change — fixed generally by discarding **two** frames
+(not one) before every real capture, rather than trying to detect which requests are "first of their
+kind". Verified end-to-end: `imagearray` (both JSON and `ImageBytes`) now returns correctly-shaped,
+correctly-valued data on every request, with no lag from a previous request's settings, and `ImageBytes` is
+still ~6x faster than JSON in practice (1.4s vs. 8.9s for a full frame).
+
+Cross-compiles cleanly (`-Wall -Wextra`, no warnings); binary stripped and kept in sync in the
+`overlay-luckfox-astroguider` overlay. Full detail in `alpaca/README.md`, "Persistent V4L2 device".
+
+**Latency follow-up, same day: PHD2 0.5s-exposure loop still took longer than 0.5s — two more fixes, both
+hardware-verified.** (1) The `vertical_blanking`-settle fix above originally paid its extra discard round
+on *every* capture, not just the one that actually raises `vertical_blanking` — `v4l2_capture_frame()` now
+takes an `extra_settle` flag that `exposure_worker()` only sets on that specific request. (2)
+`send_imagebytes()`'s transpose loop was cache-blocked (32x32 tiles, row-major reads) instead of one
+`pixels[y*w+x]` at a time — measured **pack time dropped from ~1078ms to ~80-100ms (~12x)**. A full
+0.5s-exposure loop (via `curl`/`adb forward`) went from ~2.3-2.5s to ~0.9-1.3s. Remaining dominant cost is
+`mg_write()` itself, measured ~620-655ms here — but that's through the `adb forward` TCP tunnel (this host
+has no route onto the board's real `usb0` RNDIS interface), not the real link a client uses, so treat it as
+a testing artifact pending a real-client remeasurement, not a confirmed regression. Full detail in
+`alpaca/README.md`, "Latency: conditional discard + cache-blocked transpose".
+
+**Boot-to-discoverable delay: dhcpcd `usb0` timeout fix added, not yet measured (2026-09-15).** `dhcpcd`
+always tries a real DHCP lease first on every interface, including `usb0` — a point-to-point USB RNDIS
+link that never has a DHCP server on the other end, so that solicit wastes several seconds before falling
+back to the IPv4LL self-assignment that's actually used (see the networking fix above). Added an
+`etc/dhcpcd.conf` overlay (`interface usb0 { timeout 1 }`) via the same `RK_POST_OVERLAY` mechanism.
+Verified it lands in the built rootfs; not yet rigorously timed before/after on hardware.
+
+**RAM/CMA reservation: confirmed not yet touched, and reasoned through why it likely wouldn't help
+framerate anyway (2026-09-15).** User asked whether shrinking the 24MB CMA reservation (see RAM
+explanation above) would help the framerate complaint. It has not been implemented. Reasoning: CMA backs
+V4L2's DMA capture buffers specifically, general `MemTotal`/`malloc()` backs `alpacad`'s own heap — they're
+separate pools, and the real per-frame latency (see above) is capture/serialize-bound, not
+memory-availability-bound. This reasoning has not itself been empirically stress-tested, but the timing
+instrumentation above already fully explains the observed slowness without invoking RAM at all.
+
+**Hot-iteration workflow found, with a bus-power gotcha (2026-09-15).** For `alpacad`-only changes,
+`adb push`ing the cross-compiled binary straight to `/usr/bin/alpacad` and restarting via
+`/etc/init.d/S60alpacad restart` is much faster than a full SD-card reflash. **Gotcha:** this board is
+USB-bus-powered, so unplugging it (to move it between machines) is an unclean power cut, not a graceful
+shutdown. `adb push` doesn't `fsync`, and ext4 delayed allocation can leave the pushed data dirty in page
+cache — cutting power before it flushes zeroes the file on the next boot's journal replay. This happened
+for real this session (`alpacad` silently became a 0-byte file after a reconnect, which looked exactly
+like a network/discovery bug at first). **Always run `sync; sync` on-device right after any `adb push` of
+a binary meant to survive a power cycle.** Also: the live SD card now has newer `alpacad` code (via this
+hot-push workflow) than the last full `./build.sh ... firmware` output — run a fresh full build before
+trusting `output/image/sd_update.img` for a reflash.
 
 PC-side tooling: `grab.py` was the sensor-bringup/testing tool and **is no longer being maintained** —
 the project has moved on to the on-device Alpaca driver above; `grab.py` and its diagnostic siblings
@@ -322,17 +450,19 @@ Working style for this project: prefer empirical validation over guessing (measu
 dark frames as ground truth); push back on unverified fixes offered as definitive — get the actual
 measurement or check.
 
-Open next steps: (1) re-verify the real usb0 link now that addressing is link-local, not static, and test
-against a real Alpaca client or the ASCOM Conformance tool — in particular confirm `imagearray`'s
-row/column element ordering; (2) physically reflash with the current build (`output/image/sd_update.img`,
-not a dated `IMAGE/` snapshot) to measure the `quiet` bootarg's real effect and re-run the boot-time
-measurement — USB flashing isn't possible on this board (no onboard eMMC/NAND), use SocToolKit's SD Card
-tab; (3) push the SC3336
-exposure ceiling as far as it goes — the go/no-go signal for long exposures, and note the Alpaca driver's
-`ExposureMax` already tracks this automatically once it moves; (4) implement `ImageBytes` binary transfer
-in the Alpaca driver once real-client testing is underway (JSON `imagearray` is ~2x the raw payload size);
-(5) optional follow-up: disable ISP/RGA/MPP/NPU/audio in kernel Kconfig too (they currently still
-compile, just aren't loaded) for a further flash-size cut; (6) separately, a custom SPI NAND board
-config for the 64–128MB deployment target — not started, independent of the SD_CARD debloat above; this
-is also where Rockchip's thunderboot fast-boot feature becomes applicable; (7) longer term, retarget the
-whole stack to RV1106G3 (256MB RAM) once validated on RV1103.
+Open next steps: (1) commit the current working-tree changes (dimension-order/`Type`/`Rank` `imagearray`
+fix, Int16-safe gain scale, persistent V4L2 device incl. the two settling fixes, latency instrumentation,
+dhcpcd `usb0` timeout) — all now hardware-verified this session (direct HTTP/log-based testing), nothing
+since the "Confirm ImageBytes and exposure fixes" commit has been committed yet; (2) retest against a real
+SharpCap/N.I.N.A./PHD2 session — this session verified correctness via direct HTTP calls and log
+inspection, not a live ASCOM client, though the underlying data is now confirmed correct so this is
+expected to just work; (3) re-run the boot-time measurement to check the `quiet` bootarg's real effect,
+now that a board is connected; (4) the cache-blocked transpose fix for `send_imagebytes()`'s pixel-pack
+loop (~4x the cost of the actual network write) — the other half of the per-frame latency work, still not
+started, and now the largest *unfixed* latency item; (5) push the SC3336 exposure ceiling as far as it
+goes — the go/no-go signal for long exposures, and note the Alpaca driver's `ExposureMax` already tracks
+this automatically once it moves; (6) optional follow-up: disable ISP/RGA/MPP/NPU/audio in kernel Kconfig
+too (they currently still compile, just aren't loaded) for a further flash-size cut; (7) separately, a
+custom SPI NAND board config for the 64–128MB deployment target — not started, independent of the SD_CARD
+debloat above; this is also where Rockchip's thunderboot fast-boot feature becomes applicable; (8) longer
+term, retarget the whole stack to RV1106G3 (256MB RAM) once validated on RV1103.

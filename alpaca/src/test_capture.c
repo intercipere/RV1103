@@ -15,9 +15,15 @@ int main(int argc, char **argv) {
 	if (v4l2_ctrl_get_range(s->subdev_path, s->ctrl_exposure, &emin, &emax) == 0)
 		printf("exposure range: %" PRId64 "..%" PRId64 " rows\n", emin, emax);
 
+	if (v4l2_capture_init(s) != 0) {
+		fprintf(stderr, "v4l2_capture_init failed\n");
+		return 1;
+	}
+
 	v4l2_frame_t frame;
-	if (v4l2_capture_frame(s, &frame) != 0) {
+	if (v4l2_capture_frame(&frame, 0) != 0) {
 		fprintf(stderr, "capture failed\n");
+		v4l2_capture_shutdown();
 		return 1;
 	}
 	printf("captured %dx%d\n", frame.width, frame.height);
@@ -43,5 +49,6 @@ int main(int argc, char **argv) {
 	}
 
 	free(frame.pixels);
+	v4l2_capture_shutdown();
 	return 0;
 }
