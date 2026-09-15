@@ -1,0 +1,10 @@
+#!/bin/sh
+
+case $1 in
+	start)
+		echo "usb0config disabled (OpenAstroGuider debloat) -- vendor QA-harness script; conflicted with S50usbdevice's own usb0 IP (172.32.0.70 vs 172.32.0.93) and cost ~1s of boot time in a retry loop"
+		;;
+	*)
+		exit 1
+		;;
+esac

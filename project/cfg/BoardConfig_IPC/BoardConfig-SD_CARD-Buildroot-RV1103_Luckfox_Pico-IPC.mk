@@ -35,7 +35,11 @@ export RK_UBOOT_DEFCONFIG_FRAGMENT=rk-emmc.config
 #       <partdef> := <size>[@<offset>](part-name)
 # Note:
 #   If the first partition offset is not 0x0, it must be added. Otherwise, it needn't adding.
-export RK_PARTITION_CMD_IN_ENV="32K(env),512K@32K(idblock),512K(uboot),32M(boot),256M(userdata),-(rootfs)"
+# OpenAstroGuider: shrunk boot (was 32M; boot.img is only ~3.7M) and userdata
+# (was 256M; /tmp is the RAM-backed scratch space, userdata only needs to hold
+# small config/calibration files) to fit a 128MB SD card, simulating the SPI
+# NAND target's storage budget. rootfs ("-") takes whatever remains.
+export RK_PARTITION_CMD_IN_ENV="32K(env),512K@32K(idblock),512K(uboot),8M(boot),16M(userdata),-(rootfs)"
 
 # config partition's filesystem type (squashfs is readonly)
 # emmc:    squashfs/ext4
@@ -121,3 +125,23 @@ export RK_PRE_BUILD_USERDATA_SCRIPT=luckfox-userdata-pre.sh
 # (no rkipc, no ISP/RGA/MPP/NPU/audio/motor kernel modules) and disables
 # iptables/telnet/sshd/micinit at boot.
 export RK_POST_OVERLAY="overlay-luckfox-config overlay-luckfox-buildroot-init overlay-luckfox-buildroot-shadow overlay-luckfox-astroguider"
+
+#################################################
+# 	OpenAstroGuider: restore trimmed buildroot defconfig
+#################################################
+# sysdrv/source/buildroot/ is entirely gitignored (sysdrv/.gitignore), so the
+# debloated luckfox_pico_defconfig living there does not survive a fresh
+# clone or a from-scratch vendor-source re-extraction. The real, tracked copy
+# lives alongside this board config; this board config is sourced by
+# project/build.sh (see `[ -L "$BOARD_CONFIG" ] && source $BOARD_CONFIG`)
+# before the buildroot defconfig is symlinked into place
+# (__LINK_DEFCONFIG_FROM_BOARD_CFG), so copying it here self-heals every
+# build. Edit the tracked copy, not the vendor-tree one, to persist changes.
+_LF_BOARDCFG_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+_LF_TRACKED_DEFCONFIG="$_LF_BOARDCFG_DIR/luckfox_pico_defconfig"
+_LF_VENDOR_DEFCONFIG="$_LF_BOARDCFG_DIR/../../../sysdrv/source/buildroot/buildroot-2023.02.6/configs/luckfox_pico_defconfig"
+if [ -f "$_LF_TRACKED_DEFCONFIG" ]; then
+	mkdir -p "$(dirname "$_LF_VENDOR_DEFCONFIG")"
+	cp -f "$_LF_TRACKED_DEFCONFIG" "$_LF_VENDOR_DEFCONFIG"
+fi
+unset _LF_TRACKED_DEFCONFIG _LF_VENDOR_DEFCONFIG
