@@ -301,8 +301,13 @@ vs 6.4s for JSON (~9x faster)**, confirmed correct via both a manual decode and 
 shape report matches `camera_api.c`'s existing `[row][col]` nesting exactly; there was never an ordering
 bug. Separately, "exposure duration doesn't apply" was tested and is **not a server-side bug**: 0.01s
 exposure gave mean 85, 1s exposure gave mean 677 with the sensor saturating at 1023 (full overexposure,
-correct daylight behavior) — if PHD2 still shows this, the mismatch is between PHD2/the ASCOM bridge and
-what's actually transmitted, not our exposure control.
+correct daylight behavior).
+
+**Both confirmed fixed in real end-to-end PHD2 testing on Windows with the latest build**: images arrive
+noticeably faster, exposure duration now looks correct. Likely explanation for the duration symptom: with
+the old ~6-10s JSON fetch, PHD2 could have been displaying a stale frame while a much shorter new exposure
+had already completed — a symptom of the slow-fetch bug, not a separate one. Resolved once ImageBytes
+dropped fetch time to ~0.7s.
 
 **Not yet done:** tested against the ASCOM Conformance tool; investigate the 15-20s discovery delay
 (likely IPv4LL probe/announce timing, RFC 3927 allows ~9s of probing alone); diagnose PHD2's

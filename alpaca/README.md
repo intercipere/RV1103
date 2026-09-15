@@ -292,10 +292,14 @@ Got actual guide exposures out of PHD2 end-to-end. Two things came up:
    was already correct — no ordering bug ever existed.
 2. **"Exposure duration doesn't seem to apply" — confirmed NOT a server-side bug.** Tested directly:
    0.01s exposure → mean pixel value 85 (max 650); 1s exposure → mean 677, **saturating at 1023** (full
-   overexposure, exactly as expected in daylight). Server-side duration handling is correct; if PHD2 still
-   shows this, the mismatch is somewhere between PHD2/the ASCOM bridge and what it actually sends — worth
-   checking with `alpaca/test_client.py` against varying durations from the PHD2/Windows side, or checking
-   PHD2's own logs for the literal `Duration` value it's transmitting.
+   overexposure, exactly as expected in daylight). Server-side duration handling is correct.
+
+**Both confirmed fixed in real end-to-end PHD2 testing on Windows** (not just isolated `curl`/`alpyca`
+checks): images arrive noticeably faster, and exposure duration now looks correct. The likely explanation
+for #2 having looked broken in the first place: with the old ~6-10s JSON fetch time, PHD2 could easily
+have been displaying a stale/previous frame while a much shorter new exposure had already completed,
+making brightness look mismatched from the duration setting — a symptom of #1, not a separate bug. Once
+fetches dropped to ~0.7s, that confusion went away on its own.
 3. **RAM re-confirmed via `dmesg`, with the full explanation**: `Memory: 32368K/65536K available ...
    24576K cma-reserved` — the chip genuinely has **64MB physical RAM** (not wrong to assume that), but
    24MB is reserved for the Contiguous Memory Allocator (`RK_BOOTARGS_CMA_SIZE="24M"` in the board
