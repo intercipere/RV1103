@@ -983,3 +983,28 @@ what let them drift apart in the first place. Note for later: if real subframing
 `StartX`/`StartY` shifts the effective pattern and must be XORed into these.
 
 Verified on hardware: `sensortype=2`, `bayeroffsetx=1`, `bayeroffsety=1`.
+
+## USB gadget MAC pinned to the SoC serial (2026-09-16)
+
+`S50usbdevice` never set the RNDIS `host_addr`/`dev_addr`, so `f_rndis` generated random MACs at every
+boot. `host_addr` is the MAC the *host* assigns to its own end of the link, so a random one means Linux
+renames the interface (`enx<host_addr>`) and NetworkManager creates a fresh, unconfigured profile stuck in
+DHCP on every replug — and Windows creates a new network profile each time too. Confirmed directly:
+`host_addr` was `82:3b:15:91:0f:4e` while the host interface was `enx823b15910f4e`.
+
+Fixed in the overlay's copy of `S50usbdevice` (a 2-line functional change right after
+`mkdir ${USB_FUNCTIONS_DIR}/rndis.gs0`). The MAC is **derived from the SoC's unique chip serial**
+(`/proc/cpuinfo` `Serial`, which is also the adb serial) rather than hardcoded, so each board is stable
+across reboots but still distinct from every other board — two of these on one PC would otherwise collide.
+First octet 0x02 (host) / 0x06 (device): locally administered, unicast.
+
+Verified by a real reboot: `host_addr` came back `02:21:7a:b8:e8:3f`, adb returned in ~10s, and the host
+interface is now permanently `enx02217ab8e83f`. Low-risk by construction — the vendor's `test_write` helper
+is `test -e $2 && echo $1 > $2`, so a rejected write leaves the gadget coming up exactly as before.
+
+Host-side setup is then a one-time `nmcli con add type ethernet con-name oag-usb ifname enx02217ab8e83f
+ipv4.method link-local`, which auto-connects from then on.
+
+Note this forks the vendor `S50usbdevice` into the overlay (as the overlay already does for `RkLunch.sh`
+and `insmod_ko.sh`); there is no config-file hook for MACs — `parse_parameter()` only understands the
+`ums_*` keys.

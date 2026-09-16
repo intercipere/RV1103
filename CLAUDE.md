@@ -506,6 +506,16 @@ matches, including partial-band/partial-tile dimensions). Two related changes in
   in both directions, **starting with a long exposure right after daemon start** (the exact original
   failure case), using the device's own `OAG_FRAME_STATS` means as ground truth. Correctness identical;
   loop time **-25% at 0.3s, -31% at 0.5s, -36% at 0.8s**. Flag and parameter fully removed.
+- **USB gadget MAC pinned (2026-09-16, hardware-verified).** `S50usbdevice` never set RNDIS
+  `host_addr`/`dev_addr`, so `f_rndis` randomized them every boot; `host_addr` is what names the host's
+  interface (`enx<host_addr>`), so Linux got a new NM profile stuck in DHCP on every replug and Windows a
+  new network profile each plug. Fixed in the overlay's forked `S50usbdevice` (2 functional lines after
+  `mkdir .../rndis.gs0`), with the MAC **derived from the SoC chip serial** (`/proc/cpuinfo` `Serial`)
+  rather than hardcoded, so boards are stable across reboots but distinct from each other. 0x02/0x06 first
+  octet = locally administered, unicast. Verified by real reboot: `02:21:7a:b8:e8:3f`, adb back in ~10s,
+  host interface now permanently `enx02217ab8e83f`. Low-risk: vendor `test_write` is
+  `test -e $2 && echo $1 > $2`, so a rejected write changes nothing. Host side: one-time
+  `nmcli con add type ethernet con-name oag-usb ifname enx02217ab8e83f ipv4.method link-local`.
 - **Remaining lever:** binning/subframe — the only thing that cuts the 265ms write, and much bigger:
   2x2 binning gives 1.5MB and a ~66ms write, ~200ms saved. IMX290 (production) is mono so 2x2 binning is
   trivial there; SC3336 is Bayer, so binning a quad mixes colour channels — a real design decision.
