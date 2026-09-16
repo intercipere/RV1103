@@ -27,6 +27,11 @@ int main(void) {
 	        g_device.sensor->display_name, g_device.sensor->width,
 	        g_device.sensor->height, g_device.sensor->row_time_us);
 
+	/* Gain and vertical_blanking are pinned once, here, rather than per
+	 * exposure -- and before streaming starts, so the very first frame is
+	 * already captured with them. See camera_api.c. */
+	camera_apply_fixed_sensor_settings(g_device.sensor);
+
 	/* Opened once here and kept streaming for the daemon's whole lifetime --
 	 * see v4l2_capture.h for why (avoids a ~515-523ms open/STREAMON/.../
 	 * STREAMOFF/close teardown on every single exposure). If this fails

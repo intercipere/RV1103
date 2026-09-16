@@ -27,8 +27,6 @@ static const sensor_desc_t known_sensors[] = {
 		.height = 1296,
 		.v4l2_fourcc = v4l2_fourcc('B', 'G', '1', '0'), /* 10-bit Bayer BGGR/GRGR */
 		.bayer = BAYER_BGGR,
-		.bayer_offset_x = 0,
-		.bayer_offset_y = 0,
 		.max_adu = 1023,
 		.pixel_size_um_x = 2.0,
 		.pixel_size_um_y = 2.0,
@@ -36,7 +34,7 @@ static const sensor_desc_t known_sensors[] = {
 		.ctrl_exposure = "exposure",
 		.ctrl_gain = "analogue_gain",
 		.ctrl_vblank = "vertical_blanking",
-		.unpack = unpack_bits_lsb,
+		.unpack = unpack_bits_lsb_transposed,
 	},
 	{
 		/* Production target -- values are placeholders (marked TODO) until
@@ -51,8 +49,6 @@ static const sensor_desc_t known_sensors[] = {
 		.height = 1080, /* TODO: confirm against real hardware */
 		.v4l2_fourcc = v4l2_fourcc('B', 'G', '1', '0'), /* TODO: confirm */
 		.bayer = BAYER_NONE, /* mono variant assumed for this project */
-		.bayer_offset_x = 0,
-		.bayer_offset_y = 0,
 		.max_adu = 1023,
 		.pixel_size_um_x = 2.9, /* TODO: confirm against datasheet */
 		.pixel_size_um_y = 2.9,
@@ -60,7 +56,7 @@ static const sensor_desc_t known_sensors[] = {
 		.ctrl_exposure = "exposure",
 		.ctrl_gain = "analogue_gain",
 		.ctrl_vblank = "vertical_blanking",
-		.unpack = unpack_bits_lsb, /* TODO: confirm packing once hardware exists */
+		.unpack = unpack_bits_lsb_transposed, /* TODO: confirm packing once hardware exists */
 	},
 };
 
@@ -76,8 +72,6 @@ static const sensor_desc_t fallback_sensor = {
 	.height = 480,
 	.v4l2_fourcc = 0,
 	.bayer = BAYER_NONE,
-	.bayer_offset_x = 0,
-	.bayer_offset_y = 0,
 	.max_adu = 255,
 	.pixel_size_um_x = 1.0,
 	.pixel_size_um_y = 1.0,
@@ -85,7 +79,7 @@ static const sensor_desc_t fallback_sensor = {
 	.ctrl_exposure = "exposure",
 	.ctrl_gain = "analogue_gain",
 	.ctrl_vblank = "vertical_blanking",
-	.unpack = unpack_bits_lsb,
+	.unpack = unpack_bits_lsb_transposed,
 };
 
 static int read_subdev_name(char *out, size_t outlen) {

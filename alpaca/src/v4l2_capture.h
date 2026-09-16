@@ -23,6 +23,10 @@ typedef struct {
 	int height;
 } v4l2_frame_t;
 
+/* NOTE: `pixels` is in ASCOM ImageBytes wire order -- pixels[x * height + y],
+ * X outer -- not row-major. desc->unpack produces it that way directly; see
+ * sensor.h and unpack.h for why. */
+
 /*
  * Opens desc->video_path, allocates a single mmap'd buffer, and starts
  * streaming -- once, kept open across exposures instead of reopened per
@@ -43,11 +47,9 @@ void v4l2_capture_shutdown(void);
  * Captures one frame reflecting the caller's most recent v4l2_ctrl_set()
  * calls, discarding whatever the driver already had queued from before
  * those calls (necessary because streaming never stops between exposures --
- * see the .c file). Pass extra_settle=1 if this call just changed
- * vertical_blanking; a plain gain/exposure change doesn't need it (see
- * alpaca/README.md, "Persistent V4L2 device"). Returns 0 on success, -1 on
- * error (including if v4l2_capture_init() wasn't called or failed).
+ * see the .c file). Returns 0 on success, -1 on error (including if
+ * v4l2_capture_init() wasn't called or failed).
  */
-int v4l2_capture_frame(v4l2_frame_t *out, int extra_settle);
+int v4l2_capture_frame(v4l2_frame_t *out);
 
 #endif

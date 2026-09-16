@@ -13,6 +13,27 @@
 #include <strings.h>
 #include <time.h>
 
+/* Reads the PUT body (application/x-www-form-urlencoded) into `params`,
+ * merging in any query-string parameters too -- Alpaca clients are only
+ * required to use the body for PUT, but tolerating both is harmless and
+ * matches how permissive real-world clients tend to be. */
+static void parse_request_params(struct mg_connection *conn, params_t *out) {
+	const struct mg_request_info *ri = mg_get_request_info(conn);
+	params_parse(ri->query_string, out);
+
+	if (strcasecmp(ri->request_method, "PUT") == 0) {
+		char body[2048];
+		int n = mg_read(conn, body, sizeof(body) - 1);
+		if (n > 0) {
+			body[n] = '\0';
+			params_t body_params;
+			params_parse(body, &body_params);
+			for (int i = 0; i < body_params.count && out->count < PARAMS_MAX; i++)
+				out->params[out->count++] = body_params.params[i];
+		}
+	}
+}
+
 /* Monotonic milliseconds, for precisely timing where per-request latency
  * actually goes (V4L2 setup/capture overhead vs. HTTP serialization/
  * transfer) instead of guessing -- prefixed onto every log line below. */
@@ -60,14 +81,9 @@ static int64_t gain_practical_max(int64_t gmin, int64_t gmax) {
 	return ceiling < gmax ? ceiling : gmax;
 }
 
-static long ascom_gain_to_raw(long ascom_v, int64_t gmin, int64_t gmax) {
-	int64_t practical_max = gain_practical_max(gmin, gmax);
-	if (ascom_v < 0) ascom_v = 0;
-	if (ascom_v > ASCOM_GAIN_MAX) ascom_v = ASCOM_GAIN_MAX;
-	if (practical_max <= gmin) return (long)gmin;
-	return (long)(gmin + (ascom_v * (practical_max - gmin)) / ASCOM_GAIN_MAX);
-}
-
+/* The inverse (ASCOM scale -> raw) went away with the gain pin below; it is
+ * a three-line mirror of raw_gain_to_ascom() when client-settable gain comes
+ * back. */
 static long raw_gain_to_ascom(long raw_v, int64_t gmin, int64_t gmax) {
 	int64_t practical_max = gain_practical_max(gmin, gmax);
 	if (practical_max <= gmin) return 0;
@@ -77,35 +93,76 @@ static long raw_gain_to_ascom(long raw_v, int64_t gmin, int64_t gmax) {
 	return v;
 }
 
-/* Reads the PUT body (application/x-www-form-urlencoded) into `params`,
- * merging in any query-string parameters too -- Alpaca clients are only
- * required to use the body for PUT, but tolerating both is harmless and
- * matches how permissive real-world clients tend to be. */
-static void parse_request_params(struct mg_connection *conn, params_t *out) {
-	const struct mg_request_info *ri = mg_get_request_info(conn);
-	params_parse(ri->query_string, out);
 
-	if (strcasecmp(ri->request_method, "PUT") == 0) {
-		char body[2048];
-		int n = mg_read(conn, body, sizeof(body) - 1);
-		if (n > 0) {
-			body[n] = '\0';
-			params_t body_params;
-			params_parse(body, &body_params);
-			for (int i = 0; i < body_params.count && out->count < PARAMS_MAX; i++)
-				out->params[out->count++] = body_params.params[i];
-		}
+/* Gain is pinned (project decision, 2026-09-16) at the subdev's own minimum,
+ * 128 = 1x. vertical_blanking is NOT pinned any more (restored 2026-09-16
+ * once the frame-delivery path was fast enough to stop needing a fixed frame
+ * period): exposure_worker() raises it again when a requested exposure
+ * exceeds the current frame-length ceiling, which is what makes exposures
+ * longer than ~37ms possible at all.
+ *
+ * OAG_FIXED_VBLANK is now just the value blanking is initialised to at
+ * startup, not a cap. Undo the gain pin by restoring the client-settable
+ * mapping in the "gain" handler and passing job->gain to v4l2_ctrl_set()
+ * again. */
+#define OAG_FIXED_GAIN 128
+#define OAG_FIXED_VBLANK 64
+/* Spare rows kept between the requested exposure and the frame-length ceiling
+ * when raising blanking, so the exposure lands strictly inside the frame
+ * rather than exactly on the boundary. */
+#define VBLANK_HEADROOM 64
+
+void camera_apply_fixed_sensor_settings(const sensor_desc_t *s) {
+	/* Blanking is set here only to establish a known starting frame period;
+	 * exposure_worker() moves it as needed. */
+	v4l2_ctrl_set(s->subdev_path, s->ctrl_vblank, OAG_FIXED_VBLANK);
+	v4l2_ctrl_set(s->subdev_path, s->ctrl_gain, OAG_FIXED_GAIN);
+	int64_t vb = -1, g = -1;
+	v4l2_ctrl_get(s->subdev_path, s->ctrl_vblank, &vb);
+	v4l2_ctrl_get(s->subdev_path, s->ctrl_gain, &g);
+	fprintf(stderr, "[init] pinned vertical_blanking=%lld analogue_gain=%lld\n",
+	        (long long)vb, (long long)g);
+}
+
+/* ASCOM's SensorType enum has no BGGR/GRBG/GBRG members -- RGGB (2) is its
+ * only Bayer value -- so the actual colour arrangement can ONLY be conveyed
+ * through BayerOffsetX/Y, which state where this sensor's top-left pixel sits
+ * inside the reference RGGB 2x2:
+ *
+ *     RGGB tiled:  R G R G     (0,0) -> RGGB    (1,0) -> GRBG
+ *                  G B G B     (0,1) -> GBRG    (1,1) -> BGGR
+ *                  R G R G
+ *
+ * This was previously reported as (0,0) for the BGGR SC3336, i.e. "red is
+ * top-left" when blue actually is -- a straight red/blue swap, which is
+ * exactly how it showed up in SharpCap and N.I.N.A. (brown furniture
+ * rendering blue). Confirmed empirically 2026-09-16 by debayering one frame
+ * all four ways: BGGR gives warm tungsten lamps, green plants and a wooden
+ * floor; RGGB gives the mirror (blue lamps); GRBG/GBRG collapse to R ~= B
+ * with G suppressed, the signature of a wrong-phase demosaic.
+ *
+ * Derived from desc->bayer rather than stored per sensor, so the pattern and
+ * the reported offset cannot drift apart -- that duplication is what produced
+ * the bug. If real subframing is ever implemented, an odd StartX/StartY shifts
+ * the effective pattern and must be XORed in here. */
+static void bayer_offsets(bayer_pattern_t p, int *ox, int *oy) {
+	switch (p) {
+	case BAYER_RGGB: *ox = 0; *oy = 0; break;
+	case BAYER_GRBG: *ox = 1; *oy = 0; break;
+	case BAYER_GBRG: *ox = 0; *oy = 1; break;
+	case BAYER_BGGR: *ox = 1; *oy = 1; break;
+	default:         *ox = 0; *oy = 0; break;
 	}
 }
 
 /* Computes the true achievable exposure ceiling non-invasively: reads the
  * exposure control's max at the CURRENT vertical_blanking plus the
  * vertical_blanking control's own max, and infers the fixed margin between
- * frame length and max exposure (observed empirically: default vblank=64
- * gives exposure max=1352, i.e. margin=(1296+64)-1352=8 rows) without
- * actually touching vertical_blanking just to ask the question. See
- * grab.py's apply_settings() for the same relationship used when actually
- * raising the exposure past the current headroom. */
+ * frame length and max exposure (observed empirically: vblank=64 gives
+ * exposure max=1352, i.e. margin=(1296+64)-1352=8 rows) without actually
+ * touching vertical_blanking just to answer the question. Restored
+ * 2026-09-16 along with the vblank-raising in exposure_worker(); while
+ * blanking was pinned this just returned the current max. */
 static long compute_exposure_max_rows(const sensor_desc_t *s) {
 	int64_t vblank_cur = 0, vblank_min = 0, vblank_max = 0;
 	int64_t exp_max_cur = 0, exp_min = 0;
@@ -126,7 +183,6 @@ static long compute_exposure_max_rows(const sensor_desc_t *s) {
 typedef struct {
 	const sensor_desc_t *sensor;
 	long rows;
-	long gain;
 } exposure_job_t;
 
 static void *exposure_worker(void *arg) {
@@ -134,41 +190,58 @@ static void *exposure_worker(void *arg) {
 	const sensor_desc_t *s = job->sensor;
 
 	/* Raise vertical_blanking first if the requested exposure exceeds the
-	 * current headroom -- exact same relationship grab.py's
-	 * apply_settings() already validated on this sensor family. */
-	int64_t vblank_cur = 0, vblank_max = 0, exp_min = 0, exp_max_cur = 0;
+	 * current headroom -- exposure is capped by frame length (height +
+	 * vertical_blanking) minus a small fixed margin, so blanking has to move
+	 * before a longer exposure will actually apply. Same relationship
+	 * grab.py's apply_settings() validated on this sensor family.
+	 *
+	 * Lower it again when a short exposure follows a long one: blanking left
+	 * high keeps the frame period long, which would make every subsequent
+	 * short exposure wait out the old, slow frame period -- exactly the
+	 * "frames come in slow" symptom this session spent its time removing.
+	 * Analogue gain is pinned and is not touched here. */
+	int64_t vblank_cur = 0, vblank_min = 0, vblank_max = 0;
+	int64_t exp_min = 0, exp_max_cur = 0;
 	v4l2_ctrl_get(s->subdev_path, s->ctrl_vblank, &vblank_cur);
-	v4l2_ctrl_get_range(s->subdev_path, s->ctrl_vblank, &exp_min, &vblank_max);
+	v4l2_ctrl_get_range(s->subdev_path, s->ctrl_vblank, &vblank_min, &vblank_max);
 	v4l2_ctrl_get_range(s->subdev_path, s->ctrl_exposure, &exp_min, &exp_max_cur);
-	int vblank_raised = job->rows > exp_max_cur;
-	if (vblank_raised) {
-		int64_t new_vblank = vblank_cur + (job->rows - exp_max_cur) + 64;
-		if (new_vblank > vblank_max) new_vblank = vblank_max;
-		v4l2_ctrl_set(s->subdev_path, s->ctrl_vblank, new_vblank);
-	}
-	v4l2_ctrl_set(s->subdev_path, s->ctrl_gain, job->gain);
-	v4l2_ctrl_set(s->subdev_path, s->ctrl_exposure, job->rows);
 
-	/* Diagnostic (2026-09-15, see the request logging above): confirm what
-	 * actually got applied to hardware and what the capture actually
-	 * contained, to distinguish "server captured black data" from "server
-	 * captured good data, client displayed it wrong." Timestamps added
-	 * (2026-09-15) to measure where per-frame latency actually goes --
-	 * V4L2 setup/capture overhead vs. HTTP serialization/transfer -- for
-	 * the "frames come in slow" investigation, instead of guessing. */
+	long margin = (s->height + vblank_cur) - exp_max_cur;
+	int64_t need_vblank = job->rows + margin + VBLANK_HEADROOM - s->height;
+	if (need_vblank < OAG_FIXED_VBLANK) need_vblank = OAG_FIXED_VBLANK;
+	if (need_vblank > vblank_max) need_vblank = vblank_max;
+	if (need_vblank < vblank_min) need_vblank = vblank_min;
+
+	/* Order matters, because the driver derives the exposure control's max
+	 * from the current blanking and clamps against it. Going UP: widen the
+	 * frame first, then set the longer exposure. Going DOWN: shorten the
+	 * exposure first, or the pending large value can block (or be silently
+	 * clamped by) the narrower frame. */
+	int vblank_changed = (need_vblank != vblank_cur);
+	if (need_vblank > vblank_cur) {
+		v4l2_ctrl_set(s->subdev_path, s->ctrl_vblank, need_vblank);
+		v4l2_ctrl_set(s->subdev_path, s->ctrl_exposure, job->rows);
+	} else {
+		v4l2_ctrl_set(s->subdev_path, s->ctrl_exposure, job->rows);
+		if (vblank_changed)
+			v4l2_ctrl_set(s->subdev_path, s->ctrl_vblank, need_vblank);
+		/* Re-assert: lowering blanking can clamp the value just set. */
+		v4l2_ctrl_set(s->subdev_path, s->ctrl_exposure, job->rows);
+	}
+
 	double t_ctrl_start = now_ms();
-	int64_t applied_gain = -1, applied_exposure = -1;
-	v4l2_ctrl_get(s->subdev_path, s->ctrl_gain, &applied_gain);
+	int64_t applied_exposure = -1, applied_vblank = -1;
 	v4l2_ctrl_get(s->subdev_path, s->ctrl_exposure, &applied_exposure);
+	v4l2_ctrl_get(s->subdev_path, s->ctrl_vblank, &applied_vblank);
 	fprintf(stderr,
-	        "[t=%.0f] [exposure] requested rows=%ld gain=%ld -> applied "
-	        "exposure=%lld gain=%lld\n",
-	        now_ms(), job->rows, job->gain, (long long)applied_exposure,
-	        (long long)applied_gain);
+	        "[t=%.0f] [exposure] requested rows=%ld -> applied exposure=%lld "
+	        "vblank=%lld (changed=%d)\n",
+	        now_ms(), job->rows, (long long)applied_exposure,
+	        (long long)applied_vblank, vblank_changed);
 
 	double t_capture_start = now_ms();
 	v4l2_frame_t frame;
-	int ok = (v4l2_capture_frame(&frame, vblank_raised) == 0);
+	int ok = (v4l2_capture_frame(&frame) == 0);
 	double t_capture_end = now_ms();
 	fprintf(stderr,
 	        "[t=%.0f] [exposure] v4l2_capture_frame took %.0fms (ctrl setup "
@@ -176,7 +249,11 @@ static void *exposure_worker(void *arg) {
 	        t_capture_end, t_capture_end - t_capture_start,
 	        t_capture_start - t_ctrl_start);
 
-	if (ok) {
+	/* This min/max/mean walk is diagnostic only, and it costs ~60ms per frame
+	 * on this CPU (3M pixels) *before* the frame is marked ready -- pure
+	 * latency for one log line. Off unless OAG_FRAME_STATS is set in the
+	 * environment, so it can be turned back on without a rebuild. */
+	if (ok && getenv("OAG_FRAME_STATS") != NULL) {
 		long n = (long)frame.width * frame.height;
 		uint16_t vmin = 65535, vmax = 0;
 		uint64_t sum = 0;
@@ -188,7 +265,7 @@ static void *exposure_worker(void *arg) {
 		}
 		fprintf(stderr, "[exposure] captured min=%u max=%u mean=%.1f\n", vmin,
 		        vmax, (double)sum / (double)n);
-	} else {
+	} else if (!ok) {
 		fprintf(stderr, "[exposure] v4l2_capture_frame failed\n");
 	}
 
@@ -223,7 +300,6 @@ static int h_startexposure(struct mg_connection *conn, params_t *params,
 
 	pthread_mutex_lock(&g_device.lock);
 	const sensor_desc_t *s = g_device.sensor;
-	long gain = g_device.gain;
 	if (g_device.state == CAM_EXPOSING) {
 		pthread_mutex_unlock(&g_device.lock);
 		alpaca_response_error(buf, sizeof(buf), client_txn_id, 0x407,
@@ -236,13 +312,17 @@ static int h_startexposure(struct mg_connection *conn, params_t *params,
 	g_device.last_exposure_duration_s = duration_s;
 	pthread_mutex_unlock(&g_device.lock);
 
+	/* Clamp rather than let the driver silently clip: with vertical_blanking
+	 * pinned, anything past the exposure control's max is unreachable and a
+	 * client asking for more should at least get the frame it can have. */
 	long rows = lround(duration_s * 1e6 / s->row_time_us);
 	if (rows < 1) rows = 1;
+	long rows_max = compute_exposure_max_rows(s);
+	if (rows_max > 0 && rows > rows_max) rows = rows_max;
 
 	exposure_job_t *job = malloc(sizeof(*job));
 	job->sensor = s;
 	job->rows = rows;
-	job->gain = gain;
 
 	pthread_t t;
 	pthread_create(&t, NULL, exposure_worker, job);
@@ -312,7 +392,7 @@ static int udigits(unsigned v) {
  * directly (alpaca/camera.py's _build_imagedata_array):
  *   [0:4]   MetadataVersion   [4:8]   ErrorNumber
  *   [8:12]  ClientTransactionID  [12:16] ServerTransactionID
- *   [16:20] DataStart (=44)   [20:24] ImageElementType
+ *   [16:20] DataStart (=44)   [20:24] ImageElementType (Int32=2)
  *   [24:28] TransmissionElementType   [28:32] Rank
  *   [32:36] Dimension1 (=width)  [36:40] Dimension2 (=height)
  *   [40:44] Dimension3 (0 for Rank 2)
@@ -340,7 +420,15 @@ static void send_imagebytes(struct mg_connection *conn, long client_txn_id) {
 	put_le32(hdr + 8, (int32_t)client_txn_id);
 	put_le32(hdr + 12, (int32_t)alpaca_next_server_txn());
 	put_le32(hdr + 16, IMAGEBYTES_HEADER_LEN);     /* DataStart */
-	put_le32(hdr + 20, 8);                         /* ImageElementType = UInt16 */
+	/* ImageElementType is the type the CLIENT should materialize the array
+	 * as; TransmissionElementType is the narrower type actually on the wire,
+	 * which the client widens on receipt. ASCOM's Camera.ImageArray is an
+	 * Int32 array, so ImageElementType is Int32 (2) -- matching what the JSON
+	 * path already reports as "Type":2 -- while the wire stays UInt16 (8) to
+	 * halve the transfer. These two were both 8 before (2026-09-16), i.e. the
+	 * same image was announced as Int32 over JSON and UInt16 over ImageBytes;
+	 * lenient clients use TransmissionElementType and never noticed. */
+	put_le32(hdr + 20, 2);                         /* ImageElementType = Int32 */
 	put_le32(hdr + 24, 8);                         /* TransmissionElementType = UInt16 */
 	put_le32(hdr + 28, 2);                         /* Rank */
 	put_le32(hdr + 32, w);                         /* Dimension1 = width */
@@ -356,47 +444,16 @@ static void send_imagebytes(struct mg_connection *conn, long client_txn_id) {
 	mg_response_header_send(conn);
 	mg_write(conn, hdr, sizeof(hdr));
 
-	/* Wire order is [Width][Height] (x outer, y inner); our buffer is
-	 * row-major (y outer, x inner). A naive per-pixel pixels[y*w+x] read
-	 * misses cache on nearly every access (stride w) -- measured ~1078ms of
-	 * this call's ~1.3s. Read square TILE x TILE blocks in row-major order
-	 * (cache-friendly) into a small scratch block, then emit that block
-	 * transposed -- both the read and the transpose then stay in L1. */
-#define IB_TILE 32
-	double t_loop_start = now_ms();
-	double t_write_total = 0;
-	uint16_t block[IB_TILE][IB_TILE];
-	uint16_t out[4096];
-	size_t n = 0;
-	for (int x0 = 0; x0 < w; x0 += IB_TILE) {
-		int xn = (x0 + IB_TILE <= w) ? IB_TILE : w - x0;
-		for (int y0 = 0; y0 < h; y0 += IB_TILE) {
-			int yn = (y0 + IB_TILE <= h) ? IB_TILE : h - y0;
-			for (int dy = 0; dy < yn; dy++)
-				memcpy(block[dy], &pixels[(size_t)(y0 + dy) * w + x0],
-				       (size_t)xn * sizeof(uint16_t));
-			for (int dx = 0; dx < xn; dx++) {
-				for (int dy = 0; dy < yn; dy++) {
-					out[n++] = block[dy][dx];
-					if (n == sizeof(out) / sizeof(out[0])) {
-						double tw0 = now_ms();
-						mg_write(conn, out, n * sizeof(uint16_t));
-						t_write_total += now_ms() - tw0;
-						n = 0;
-					}
-				}
-			}
-		}
-	}
-	if (n > 0) {
-		double tw0 = now_ms();
-		mg_write(conn, out, n * sizeof(uint16_t));
-		t_write_total += now_ms() - tw0;
-	}
-#undef IB_TILE
-	double t_loop_total = now_ms() - t_loop_start;
-	fprintf(stderr, "[imagebytes] pack=%.0fms write=%.0fms\n",
-	        t_loop_total - t_write_total, t_write_total);
+	/* The capture buffer is already in wire order (pixels[x*h+y], X outer) --
+	 * desc->unpack produces it that way, so there is nothing to transpose
+	 * here any more and the whole frame goes out in one write. This replaced
+	 * a separate blocked-transpose pass that cost ~76ms per frame on top of
+	 * the unpack's own ~67ms; folding it into the unpack removes a full
+	 * write+read pass over ~6MB. */
+	double tw0 = now_ms();
+	mg_write(conn, pixels, (size_t)w * h * sizeof(uint16_t));
+	double t_write_total = now_ms() - tw0;
+	fprintf(stderr, "[imagebytes] write=%.0fms\n", t_write_total);
 }
 
 static void send_imagearray(struct mg_connection *conn, long client_txn_id) {
@@ -429,15 +486,14 @@ static void send_imagearray(struct mg_connection *conn, long client_txn_id) {
 	for (int x = 0; x < w; x++) {
 		total += (x ? 1 : 0) + 1; /* leading comma (if any) + '[' */
 		for (int y = 0; y < h; y++)
-			total += (y ? 1 : 0) + (size_t)udigits(pixels[(size_t)y * w + x]);
+			total += (y ? 1 : 0) + (size_t)udigits(pixels[(size_t)x * h + y]);
 		total += 1; /* ']' */
 	}
 	total += (size_t)tail_len;
 
 	mg_send_http_ok(conn, "application/json", (long long)total);
 
-	/* Pass 2: stream through a small fixed buffer, x outer / y inner to
-	 * match the [Width][Height] wire convention. */
+	/* Pass 2: stream through a small fixed buffer, x outer / y inner. */
 	char chunk[8192];
 	size_t pos = 0;
 	memcpy(chunk, head, (size_t)head_len);
@@ -448,7 +504,7 @@ static void send_imagearray(struct mg_connection *conn, long client_txn_id) {
 		for (int y = 0; y < h; y++) {
 			if (y) chunk[pos++] = ',';
 			pos += (size_t)snprintf(chunk + pos, sizeof(chunk) - pos, "%u",
-			                         pixels[(size_t)y * w + x]);
+			                         pixels[(size_t)x * h + y]);
 			if (pos > sizeof(chunk) - 16) {
 				mg_write(conn, chunk, pos);
 				pos = 0;
@@ -549,7 +605,8 @@ static int camera_dispatch(struct mg_connection *conn, void *cbdata) {
 	if (strcasecmp(member, "bayeroffsetx") == 0) {
 		pthread_mutex_lock(&g_device.lock);
 		s = g_device.sensor;
-		int val = s->bayer_offset_x;
+		int val, oy_unused;
+		bayer_offsets(s->bayer, &val, &oy_unused);
 		int is_mono = (s->bayer == BAYER_NONE);
 		pthread_mutex_unlock(&g_device.lock);
 		if (is_mono) {
@@ -564,7 +621,8 @@ static int camera_dispatch(struct mg_connection *conn, void *cbdata) {
 	if (strcasecmp(member, "bayeroffsety") == 0) {
 		pthread_mutex_lock(&g_device.lock);
 		s = g_device.sensor;
-		int val = s->bayer_offset_y;
+		int ox_unused, val;
+		bayer_offsets(s->bayer, &ox_unused, &val);
 		int is_mono = (s->bayer == BAYER_NONE);
 		pthread_mutex_unlock(&g_device.lock);
 		if (is_mono) {
@@ -643,18 +701,21 @@ static int camera_dispatch(struct mg_connection *conn, void *cbdata) {
 		return 200;
 	}
 	if (strcasecmp(member, "gain") == 0) {
+		/* Gain is pinned at OAG_FIXED_GAIN (see the top of this file), so a
+		 * PUT is accepted and recorded but not applied to hardware -- real
+		 * clients abort the whole session if this errors, and this is a
+		 * temporary pin, not a permanent capability change. GET reports the
+		 * value actually in effect, not the one that was PUT. */
 		pthread_mutex_lock(&g_device.lock);
 		s = g_device.sensor;
 		int64_t gmin = 0, gmax = 0;
 		v4l2_ctrl_get_range(s->subdev_path, s->ctrl_gain, &gmin, &gmax);
 		if (strcasecmp(ri->request_method, "PUT") == 0) {
-			long ascom_v = params_get_int(&params, "gain", 0);
-			long raw_v = ascom_gain_to_raw(ascom_v, gmin, gmax);
-			g_device.gain = raw_v;
+			g_device.gain = OAG_FIXED_GAIN;
 			pthread_mutex_unlock(&g_device.lock);
 			alpaca_response(buf, sizeof(buf), NULL, client_txn_id, 0, "");
 		} else {
-			long ascom_v = raw_gain_to_ascom(g_device.gain, gmin, gmax);
+			long ascom_v = raw_gain_to_ascom(OAG_FIXED_GAIN, gmin, gmax);
 			pthread_mutex_unlock(&g_device.lock);
 			alpaca_response_int(buf, sizeof(buf), ascom_v, client_txn_id);
 		}

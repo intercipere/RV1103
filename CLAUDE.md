@@ -399,6 +399,120 @@ kind". Verified end-to-end: `imagearray` (both JSON and `ImageBytes`) now return
 correctly-valued data on every request, with no lag from a previous request's settings, and `ImageBytes` is
 still ~6x faster than JSON in practice (1.4s vs. 8.9s for a full frame).
 
+**Stripes regression found and fixed, plus a pinned-sensor simplification (2026-09-16).** User reported the
+previous commit broke the image completely — "only stripes now." Root cause: the cache-blocked transpose in
+`send_imagebytes()` (added in that same commit) streamed 32x32 tiles in x0-outer/y0-inner order, so each
+column's rows were emitted 32 at a time interleaved with 31 other columns instead of a whole column at a
+time. Byte count and pixel values were all correct — only the order was wrong, which is exactly why the
+pack-time win (~1078ms → ~80-100ms) looked clean: nothing in that session checked ordering. Fixed by
+blocking over a **band of whole columns** rather than square tiles, so concatenating bands is the wire
+order by construction. Verified on the host against a naive reference transpose (old loop differs, new one
+matches, including partial-band/partial-tile dimensions). Two related changes in the same pass:
+- **`REQBUFS count` restored from 1 to 3.** With a single buffer held dequeued across the whole unpack the
+  driver has no other DMA target, so on rkcif the in-flight frame can land back in the buffer userspace is
+  reading — a plausible second contributor to the stripes, though the transpose is the confirmed one. The
+  fd is now `O_NONBLOCK` + `poll()`, which also gives DQBUF a real timeout.
+- **`analogue_gain` pinned to 128 and `vertical_blanking` to 64** (project decision, to make frame-delivery
+  latency the only moving part), set once at startup before `STREAMON` instead of per frame. **This caps
+  exposure at ~1352 rows ≈ 37ms** — long exposures are off the table until the pin is lifted;
+  `exposuremax` now reports that real ceiling and `startexposure` clamps to it. Gain PUTs are accepted but
+  not applied (erroring makes real clients abort). Separately, every `v4l2_ctrl_get/set` used to reopen the
+  subdev and walk the *entire* control enumeration before its one ioctl — seven times per frame in
+  `exposure_worker()`; fd and control ids are now cached behind a mutex.
+- **Next lever:** unpack and transpose are two separate full passes over ~6MB; fusing them (unpack straight
+  into wire order, on the exposure thread) would remove one. Beyond that, `mg_write()` of 5.97MB at the
+  ~23MB/s measured over real RNDIS is a hard ~3.8 fps ceiling that only binning/subframing can move.
+- **Hardware-verified same day.** The fix is confirmed on the real board: the same frame fetched as
+  `ImageBytes` and as JSON is elementwise identical, and the decoded frame renders as a normal coherent
+  image; pushing the *same* pixels back through the old tiled loop reproduces the reported vertical stripes
+  exactly. (A "spatial coherence"/adjacent-row-correlation check was tried first and **does not
+  discriminate** — the scrambled image scored higher. Elementwise comparison against the JSON path, and
+  looking at the rendered image, are what settle it.) `exposuremax` now reports 0.0371s, matching the
+  pinned vblank exactly, and `gain` reports 0 (raw 128).
+- **Measured latency: ~0.89-0.93s per full loop** at a 20ms exposure (down from ~0.95s), device-side
+  `discard=67 dqbuf=32 unpack=64 / pack=74 write=615`. Also removed ~60ms/frame of pure waste: the
+  `captured min/max/mean` diagnostic walked all 3M pixels *before* marking the frame ready, for one log
+  line — now gated behind the `OAG_FRAME_STATS` env var.
+- **Real-link measurement settled the same day: `write=265ms`, full loop ~0.51-0.54s.** The 615ms was an
+  `adb forward` tunnel artifact inflating it ~2.3x; 5.97MB at ~22.5MB/s matches the earlier live-PHD2
+  figure. Treat every older latency number in this file measured via `adb forward` with that in mind.
+  Real-link budget: write 265ms (~51%), capture 148ms (~80ms of it the two-frame freshness guarantee,
+  67ms unpack), pack 76ms. **Getting onto the real link from Linux:** NetworkManager owns the `enx*`
+  gadget interface and sits forever in `connecting (getting IP configuration)` doing DHCP on a
+  point-to-point link, flushing any manually added address — which is what made this look unfixable and
+  kept every prior session on `adb forward`. Fix with
+  `nmcli con mod "Wired connection N" ipv4.method link-local && nmcli con up "Wired connection N"`
+  (no sudo needed). Also a product observation: Linux client hosts get no working link out of the box,
+  where Windows/macOS self-assign IPv4LL.
+- **Unpack+transpose fused (implemented, host-verified, not yet measured on hardware).**
+  `unpack_bits_lsb_transposed()` writes `out[x*height+y]` directly in 32x32 blocked tiles, so
+  `v4l2_frame_t.pixels` is stored in ImageBytes wire order throughout, `send_imagebytes()` is a single
+  `mg_write` with no per-pixel work, and the JSON path reads sequentially too. Removes a full 6MB
+  write+read pass; expect ~50-70ms, not the full 76ms (the transpose work still happens, just once).
+  Verified on host against the row-major unpack + explicit transpose at five geometries incl. ragged
+  tiles and padded stride. **`frame.pixels` is no longer row-major** — index `[x*height+y]`.
+- **USB: RV1103/RV1106 is USB 2.0 only.** `rv1106.dtsi` has a DWC3 controller (USB3-capable core) but
+  `maximum-speed = "high-speed"` and only a `u2phy` USB 2.0 PHY — no SS PHY node exists. No PCB design can
+  add USB3; that needs a different SoC. **But measured RNDIS throughput is 22.5MB/s vs ~40-45MB/s
+  realistic for USB 2.0 high-speed bulk — the gadget protocol, not the bus, is the limit.** CDC-NCM
+  aggregates frames per USB transfer where RNDIS does not, so ~2x may be available on existing hardware;
+  the tradeoff is RNDIS's driver-free Windows 10 support. Untested hypothesis, needs measurement.
+- **Long exposures restored (2026-09-16).** Real PHD2/SharpCap/N.I.N.A. testing confirmed the frame rate is
+  acceptable, so `vertical_blanking` is client-driven again; **gain stays pinned at 128**. Two things the
+  original version lacked: blanking is now *lowered* again when a short exposure follows a long one (left
+  high, the frame period stays long and every later short exposure waits out the old slow period), and the
+  control write order depends on direction (raise blanking before setting a longer exposure; set the
+  shorter exposure before narrowing blanking, then re-assert it, since the driver clamps exposure against
+  current blanking).
+- **`ImageBytes` `ImageElementType` was inconsistent with the JSON path** — JSON announced `"Type":2`
+  (Int32) while ImageBytes announced `ImageElementType=8` (UInt16) for the same image. Per spec
+  ImageElementType is what the client materializes (ASCOM `ImageArray` is Int32 = 2) and
+  TransmissionElementType is the narrower wire type (UInt16 = 8). Both were 8; now 2 and 8. Lenient
+  clients read TransmissionElementType, which is why PHD2/N.I.N.A. were unaffected.
+- **SharpCap RESOLVED (2026-09-16):** the `ImageElementType` fix (candidate 1) was it — SharpCap now
+  displays correctly alongside PHD2 and N.I.N.A. Original triage kept below for method.
+- **Bayer matrix was reported red/blue-swapped — fixed and verified (2026-09-16).** Both SharpCap and
+  N.I.N.A. showed brown as blue. **ASCOM's `SensorType` enum has no BGGR/GRBG/GBRG members** (RGGB=2 is the
+  only Bayer value), so the arrangement can only be conveyed via `BayerOffsetX/Y`, giving where the
+  top-left pixel sits in the reference RGGB 2x2: (0,0)=RGGB, (1,0)=GRBG, (0,1)=GBRG, **(1,1)=BGGR**. The
+  SC3336 is BGGR but reported (0,0). Fixed to (1,1); verified on hardware. Confirmed the sensor really is
+  BGGR by debayering one frame all four ways: BGGR gives warm lamps/green plants/wood floor, RGGB the exact
+  mirror, GRBG/GBRG collapse to R≈B with G suppressed (wrong-phase signature). **Offsets are now derived
+  from `desc->bayer` and the `bayer_offset_x/y` struct fields removed** — two sources of truth is what let
+  them drift. If subframing is added, an odd StartX/StartY shifts the effective pattern and must be XORed in.
+- **[historical] SharpCap still black while PHD2 and N.I.N.A. work (open).** Not an autostretch issue per the user.
+  Three earlier SharpCap theories in this file were wrong, so: **no more fixes shipped as explanations
+  without a captured log.** Candidates ranked: (1) the ImageElementType mismatch above (fixed, untested);
+  (2) 10-bit data in a 16-bit container — real values ~60-180 of 65535, so a client using a fixed shift
+  instead of `MaxADU` (correctly reported as 1023) renders exactly zero everywhere, matching "not even
+  noisy, just black"; fix would be a selectable full-range scale (<<6), not a format change; (3)
+  `sensortype` reports 2 (RGGB) though SC3336 is **BGGR** with `bayer_offset_x/y` both 0 instead of (1,1) —
+  a real bug, but it causes wrong colours, not black. Next step is `/tmp/alpacad.log` from a SharpCap
+  session, not another patch.
+- **JPEG output is not possible in Alpaca.** `ImageArray`/`ImageBytes` are typed numeric arrays (element
+  type enum covers Int16/Int32/Double/Single/Byte/Int64/UInt16 only); there is no encoded-image transport,
+  so no ASCOM client could request or decode one. The correct mechanism for user-selectable output is
+  **`ReadoutModes`/`ReadoutMode`**, a driver-defined named list that SharpCap and others surface in their
+  UI — the right home for "Raw 10-bit" vs "Scaled 16-bit" or a binned mode. Not implemented.
+- **Hardware-verified (2026-09-16):** fused unpack correct (ImageBytes == JSON, image clean, header
+  `ImageElementType=2/Transmission=8`); `unpack` 67->88ms but `pack` 76->0, net ~55ms as predicted, 0.02s
+  loop ~0.49s. **`ExposureMax` = 0.899s** — that is the SC3336's real driver-enforced ceiling, answering
+  the long-open "push the SC3336 exposure ceiling" question: ~0.9s. Long exposures apply exactly
+  (`rows=18214 -> vblank=16990`).
+- **`extra_settle` removed — measured obsolete (2026-09-16).** It discarded a second frame on any blanking
+  change, added for a stale-frame bug under the **old single-buffer** scheme; the 3-buffer pool + non-
+  blocking drain makes one discard sufficient. Verified by making it runtime-switchable
+  (`OAG_EXTRA_SETTLE=0/1`) and A/B-ing the *same binary* over 14 exposures alternating 0.005/0.3/0.5/0.8s
+  in both directions, **starting with a long exposure right after daemon start** (the exact original
+  failure case), using the device's own `OAG_FRAME_STATS` means as ground truth. Correctness identical;
+  loop time **-25% at 0.3s, -31% at 0.5s, -36% at 0.8s**. Flag and parameter fully removed.
+- **Remaining lever:** binning/subframe — the only thing that cuts the 265ms write, and much bigger:
+  2x2 binning gives 1.5MB and a ~66ms write, ~200ms saved. IMX290 (production) is mono so 2x2 binning is
+  trivial there; SC3336 is Bayer, so binning a quad mixes colour channels — a real design decision.
+- **Starting `alpacad` over adb needs `setsid`** — `adb shell "/etc/init.d/S60alpacad restart"` backgrounds
+  it as a child of the adb session, so it dies when the session exits, and the stale boot-time
+  `/tmp/alpacad.log` makes it look like it started fine.
+
 Cross-compiles cleanly (`-Wall -Wextra`, no warnings); binary stripped and kept in sync in the
 `overlay-luckfox-astroguider` overlay. Full detail in `alpaca/README.md`, "Persistent V4L2 device".
 

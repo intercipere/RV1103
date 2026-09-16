@@ -35,9 +35,10 @@ typedef struct {
 	int height;
 	uint32_t v4l2_fourcc; /* as accepted by VIDIOC_S_FMT on video_path */
 
-	bayer_pattern_t bayer; /* BAYER_NONE => monochrome */
-	int bayer_offset_x;    /* only meaningful when bayer != BAYER_NONE */
-	int bayer_offset_y;
+	/* BAYER_NONE => monochrome. The Alpaca BayerOffsetX/Y values are derived
+	 * from this by bayer_offsets() in camera_api.c, not stored separately --
+	 * keeping both was how they drifted apart and swapped red/blue. */
+	bayer_pattern_t bayer;
 
 	int max_adu;             /* e.g. 1023 for a 10-bit sensor */
 	double pixel_size_um_x;
@@ -56,6 +57,10 @@ typedef struct {
 	const char *ctrl_gain;
 	const char *ctrl_vblank;
 
+	/* Writes ASCOM ImageBytes wire order -- out[x * height + y], X outer --
+	 * NOT row-major. The daemon's only consumer of a frame is the wire
+	 * format, so the transpose is folded into the unpack rather than paid as
+	 * a second pass. See unpack.h. */
 	unpack_fn_t unpack;
 } sensor_desc_t;
 

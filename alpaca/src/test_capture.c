@@ -21,7 +21,7 @@ int main(int argc, char **argv) {
 	}
 
 	v4l2_frame_t frame;
-	if (v4l2_capture_frame(&frame, 0) != 0) {
+	if (v4l2_capture_frame(&frame) != 0) {
 		fprintf(stderr, "capture failed\n");
 		v4l2_capture_shutdown();
 		return 1;
@@ -44,7 +44,9 @@ int main(int argc, char **argv) {
 		if (f) {
 			fwrite(frame.pixels, sizeof(uint16_t), n, f);
 			fclose(f);
-			printf("wrote raw uint16 dump to %s\n", argv[1]);
+			printf("wrote raw uint16 dump to %s (wire order: [width][height],\n"
+			       "  x outer -- reshape as (%d,%d) and transpose)\n",
+			       argv[1], frame.width, frame.height);
 		}
 	}
 
