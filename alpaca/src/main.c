@@ -10,6 +10,7 @@
 #include "device_state.h"
 #include "discovery.h"
 #include "management_api.h"
+#include "setup_api.h"
 #include "switch_api.h"
 #include "v4l2_capture.h"
 
@@ -65,6 +66,11 @@ int main(void) {
 	management_api_register(ctx);
 	camera_api_register(ctx);
 	switch_api_register(ctx);
+	/* Browser-facing setup page (/, /setup, /setup/v1/<type>/<n>/setup) --
+	 * what a client's "Settings" button actually opens for an Alpaca device,
+	 * and the only way to reach the dew heater from a client with no ASCOM
+	 * Switch support. See setup_api.h. */
+	setup_api_register(ctx);
 
 	printf("alpacad listening on :%d (discovery UDP :32227)\n", ALPACA_TCP_PORT);
 	for (;;)

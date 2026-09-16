@@ -167,6 +167,16 @@ static int get_dew(void) {
 	return v;
 }
 
+int switch_api_dew_state(void) { return get_dew(); }
+
+dew_gpio_status_t switch_api_gpio_status(int *pin) {
+	if (pin != NULL)
+		*pin = g_gpio;
+	if (g_gpio < 0)
+		return DEW_GPIO_UNSET;
+	return g_gpio_ready ? DEW_GPIO_READY : DEW_GPIO_FAILED;
+}
+
 /* Every per-switch member takes an Id; anything outside 0..SWITCH_COUNT-1 must
  * be rejected with InvalidValue (0x401) rather than silently treated as 0 --
  * ASCOM's Conform checker probes exactly this. Returns 1 if it answered with

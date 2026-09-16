@@ -199,6 +199,9 @@ alpaca/
     management_api.h/.c - /management/* endpoints
     common_api.h/.c    - the 7 members shared by every Alpaca device type
     camera_api.h/.c    - camera-specific members + startexposure's background capture worker
+    switch_api.h/.c    - ISwitchV2 device for the lens dew heater (persisted state + sysfs GPIO)
+    setup_api.h/.c     - the browser-facing setup page served at /, /setup and every
+                         /setup/v1/<type>/<n>/setup -- what a client's "Settings" button opens
     test_capture.c     - standalone hardware test: detect sensor, capture one frame, print stats
                          (not part of alpacad; `gcc ... -o test_capture` and run manually via adb)
     test_util.c        - standalone unit tests for util.c, runs on the host (no cross-compile needed)
@@ -758,24 +761,40 @@ adb shell "killall alpacad; sleep 1; setsid /usr/bin/alpacad </dev/null >/tmp/al
 
 ## Known gaps / not yet done
 
+Kept honest as of **2026-09-16** (end of the setup-page session). Several entries that used to live here
+have since been closed by sections further down this file; if you are adding to this list, re-read it
+first rather than appending, because a stale gap list is worse than none.
+
 - **No mid-capture cancellation.** `stopexposure`/`abortexposure` reset the reported state but the
   in-flight V4L2 `DQBUF` call still runs to completion in its worker thread; its result still lands in
-  `last_frame` when done. Fine for now (captures are sub-second), would matter for longer exposures.
+  `last_frame` when done. Tolerable while exposures are short, and now more of a real gap than it was,
+  since `ExposureMax` is ~0.9s rather than ~37ms.
 - **Single exposure at a time, not deeply concurrency-hardened.** `startexposure` refuses a second call
-  while one is in flight, but there's no queueing/cancellation beyond that.
-- **Gain and `vertical_blanking` are pinned** (128 and 64) — see the 2026-09-16 section above. This caps
-  exposure at ~37ms and makes client gain control a no-op; it is a deliberate temporary simplification.
-- **`mg_write()`'s real network throughput hasn't been re-measured on the actual `usb0` RNDIS link since the
-  transpose fix** — see "Latency: conditional discard + cache-blocked transpose" above. This host can only
-  reach the board via `adb`, not the RNDIS interface, so the ~620-655ms figure measured this session is
-  likely a tunnel artifact, not a real number.
-- **`mg_write()`'s real-link throughput is still unmeasured** — every number so far is through
-  `adb forward`. See the RNDIS section above for how to reach the board directly; this is the largest
-  open question in the latency budget.
-- **Not yet retested against a real SharpCap/N.I.N.A./PHD2 session** (this session verified correctness and
-  latency via direct HTTP calls and log inspection, not a live ASCOM client) — the underlying data
-  (dimension order, `Type`/`Rank` fields, exposure/gain correctness) is hardware-verified correct, so this
-  is expected to work and be fast, but a real client hasn't confirmed it end-to-end since these fixes.
+  while one is in flight, but there is no queueing or cancellation beyond that.
+- **Gain is pinned at 128 (1x) and client gain control is a no-op.** PUTs are accepted rather than
+  errored, because real clients abort on an error. `vertical_blanking` is *not* pinned any more (see
+  "Long exposures restored"), so this is now the only remaining pin.
+- **No subframing or binning.** `StartX`/`StartY`/`NumX`/`NumY` are accepted, stored and reported, but
+  capture always returns the full sensor frame. Binning is the single largest remaining latency lever
+  (2x2 would cut the 265ms `mg_write` to ~66ms) and is blocked on a real design decision: the SC3336 is
+  Bayer, so binning a quad mixes colour channels. The production IMX290 is mono, where it is trivial.
+- **`ReadoutModes`/`ReadoutMode` not implemented.** This is the correct ASCOM mechanism for a
+  user-selectable output format ("Raw 10-bit" vs "Scaled 16-bit", or a binned mode) and the only one
+  clients surface in their UI — see "On serving JPEG instead of raw16" for why the obvious alternatives
+  are not available.
+- **Never run against the ASCOM Conformance tool.** Individual members have been checked by hand and
+  against real clients; the conformance suite has not been run, and it probes edge cases (invalid ids,
+  out-of-range values, member-before-connected ordering) that hand-testing does not.
+- **Boot-to-discoverable takes ~15-20s from plugging in**, not investigated. Most likely IPv4LL
+  probe/announce timing — RFC 3927 permits ~9s of probing before a bind is even attempted. The
+  `dhcpcd usb0 { timeout 1 }` override was added for this but its effect has never been timed
+  before/after on hardware.
+- **The dew heater's success path is unverified** — every failure mode is, but no real GPIO has ever been
+  toggled. See the dew-heater section; that test belongs with the PCB.
+- **CDC-NCM vs RNDIS is an untested hypothesis.** Measured RNDIS throughput is 22.5MB/s against
+  ~40-45MB/s realistic for USB 2.0 high-speed bulk, and NCM aggregates frames per USB transfer where
+  RNDIS does not — so roughly 2x may be available on existing hardware. The tradeoff is RNDIS's
+  driver-free Windows support. Nobody has measured it.
 
 ## USB: no USB 3.0 on this SoC, but only ~half of USB 2.0 is being used (2026-09-16)
 
@@ -1073,3 +1092,67 @@ observed is not worth the risk. That test belongs with the PCB.
 `Connected` flag + lock) instead of being hardwired to the camera, since ASCOM clients connect to each
 device independently. `parse_request_params()` moved from `camera_api.c` into `http_util.h` so both
 dispatchers share one copy.
+
+## Setup page: making the dew heater reachable from a client that has no Switch UI (2026-09-16, hardware-verified)
+
+The Switch device above is correct ASCOM, but it only helps in a client that implements ASCOM Switch and
+lets the user connect a second device. **PHD2 does not** — it knows about cameras and mounts, and nothing
+in its UI will ever enumerate a Switch device. So on the client that matters most for guiding, the heater
+was implemented, working and completely unreachable.
+
+PHD2 does have a per-camera **Settings** button. For a classic ASCOM driver that calls the driver's
+`SetupDialog()`, which draws a native dialog. For an *Alpaca* device the ASCOM Platform's Alpaca-to-COM
+bridge cannot draw a dialog for a driver running on another machine, so it implements `SetupDialog()` by
+opening the system browser at the device's setup URL. That is why the button appeared to "just open the
+browser at `<board IP>:11111`" — it was doing exactly what it is supposed to do, and nothing was listening.
+**A native popup inside PHD2 is not something this driver can provide**; the browser page *is* the
+Alpaca equivalent, and once it exists the button does the right thing.
+
+Alpaca defines two setup URLs — `/setup` for the server and `/setup/v1/<devicetype>/<devicenumber>/setup`
+per device — and neither was implemented (a conformance gap in its own right, independent of the heater).
+`setup_api.c` now serves the same page at both, plus the bare root a user is most likely to type by hand:
+whichever door a client opens, the toggle is behind it.
+
+**The page.** One self-contained document — no external stylesheet, script or font, since the only link a
+client has to the camera is the USB gadget's link-local network with no route to the internet; anything
+fetched from a CDN would simply hang. Dark with a warm/red accent rather than the usual blue, because it
+is opened at the telescope in the dark, where a blue-white UI costs the user their dark adaptation for
+minutes.
+
+Everything it shows about the camera (`sensorname`, resolution, pixel size, exposure range, `maxadu`,
+`driverversion`) is **fetched from the existing Alpaca API by the page itself**, not re-derived in
+`setup_api.c`. Two implementations of "what is the exposure range" is how `bayer_offset_x/y` drifted from
+`desc->bayer` and swapped red and blue; this page cannot disagree with what clients are told because it is
+just another client. The heater is the one exception: its state and GPIO status are rendered into the page
+by the server, so the toggle is already in the right position on first paint instead of visibly flipping
+once a request comes back — and then re-read from the API anyway, in case a Switch-aware client or a
+second tab changed it in the meantime.
+
+The toggle drives `PUT /api/v1/switch/0/setswitch`, the very same endpoint a Switch-aware client would
+use, so the two views can never disagree and the change persists to `/userdata/dewheater.state` exactly as
+before. The GPIO status is reported in the user's terms rather than the log's, keeping all three cases
+distinguishable: "no pin bound on this board" is the expected state on the prototype and must not read
+like a fault, while a pin that was asked for and could not be claimed must not read like everything is
+fine.
+
+**Routing note.** The root handler is registered as `"/$"`, not `"/"`. civetweb tries an exact match, then
+`<handler>/anything`, then *pattern* matching — and as a pattern a bare `"/"` prefix-matches every URL on
+the server. An unrecognised `/api/v1/...` path would then quietly return this HTML page instead of a JSON
+error, which is a miserable thing to debug. The `$` anchors it to the root. `"/setup"` needs no such care:
+civetweb's `<handler>/anything` step is what makes it cover the per-device URLs too.
+
+**Verified on the real board over the real RNDIS link** (not `adb forward`), in a real browser:
+
+- All four URLs (`/`, `/setup`, `/setup/v1/camera/0/setup`, `/setup/v1/switch/0/setup`) return the page,
+  `Content-Type: text/html`, with a `Content-Length` that matches the bytes actually sent exactly.
+- API routing is unaffected: `/api/v1/camera/0/sensorname` still returns JSON, an unknown member still
+  returns a JSON `ErrorNumber 1024` rather than HTML, and `/management/*` is untouched.
+- The page renders, populates live (SC3336, 2304 × 1296, 2 × 2 µm, 27 µs – 899.3 ms, 1023 ADU, plus the
+  build stamp), and logs no console errors.
+- Clicking the toggle in the browser flipped the real device: `getswitch` went to `false`,
+  `/userdata/dewheater.state` went to `0`, the daemon logged `[switch] dew heater -> off`, and clicking
+  again restored all three.
+
+The exposure minimum is one sensor row (~27 µs), which a fixed millisecond format rendered as a
+meaningless `0.0 ms` — caught by looking at the rendered page, not the code. The formatter now switches
+between µs, ms and s.

@@ -354,9 +354,9 @@ time). **Not yet verified on real hardware or a real client session** — meanin
 than the two earlier wrong theories (grounded in an independent authoritative implementation, not log
 inference), but still needs a real retest.
 
-**Not yet done:** retest SharpCap/N.I.N.A. with this fix (the real test); tested against the ASCOM Conformance tool;
-investigate the 15-20s discovery delay (likely IPv4LL probe/announce timing, RFC 3927 allows ~9s of
-probing alone).
+**Not yet done** (at the time of the entry above — SharpCap was resolved later the same day by the
+`ImageElementType` fix, see below): tested against the ASCOM Conformance tool; investigate the 15-20s
+discovery delay (likely IPv4LL probe/announce timing, RFC 3927 allows ~9s of probing alone).
 
 **Real per-frame latency measured precisely, two fixed root causes found (2026-09-15).** User reported
 0.1s PHD2 exposures still coming in slow. Added `CLOCK_MONOTONIC` timing to every V4L2 ioctl stage and
@@ -412,9 +412,10 @@ matches, including partial-band/partial-tile dimensions). Two related changes in
   driver has no other DMA target, so on rkcif the in-flight frame can land back in the buffer userspace is
   reading — a plausible second contributor to the stripes, though the transpose is the confirmed one. The
   fd is now `O_NONBLOCK` + `poll()`, which also gives DQBUF a real timeout.
-- **`analogue_gain` pinned to 128 and `vertical_blanking` to 64** (project decision, to make frame-delivery
-  latency the only moving part), set once at startup before `STREAMON` instead of per frame. **This caps
-  exposure at ~1352 rows ≈ 37ms** — long exposures are off the table until the pin is lifted;
+- **[partly superseded — see "Long exposures restored" below: `vertical_blanking` is client-driven again,
+  only the gain pin remains]** **`analogue_gain` pinned to 128 and `vertical_blanking` to 64** (project
+  decision, to make frame-delivery latency the only moving part), set once at startup before `STREAMON`
+  instead of per frame. **This capped exposure at ~1352 rows ≈ 37ms** while it was in force;
   `exposuremax` now reports that real ceiling and `startexposure` clamps to it. Gain PUTs are accepted but
   not applied (erroring makes real clients abort). Separately, every `v4l2_ctrl_get/set` used to reopen the
   subdev and walk the *entire* control enumeration before its one ioctl — seven times per frame in
@@ -535,6 +536,24 @@ matches, including partial-band/partial-tile dimensions). Two related changes in
   malformed) degrade gracefully and are verified. **The success path — a real pin toggling — is NOT
   verified**; only 3 GPIOs are claimed on this board and driving an arbitrary unrouted pin wasn't worth
   the risk. That test belongs with the PCB.
+- **Setup page added, so the dew heater is reachable from PHD2 (2026-09-16, hardware-verified).** The
+  Switch device is correct ASCOM but only helps in a client that implements ASCOM Switch; **PHD2 does
+  not**, so the heater was working and completely unreachable there. PHD2's per-camera **Settings** button
+  calls `SetupDialog()`, which for an *Alpaca* device the ASCOM Platform implements by opening the system
+  browser at the device's setup URL — it cannot draw a native dialog for a driver on another machine, so
+  **a native popup inside PHD2 is not something this driver can provide**; the browser page is the Alpaca
+  equivalent. Nothing was listening on those URLs (`/setup` and
+  `/setup/v1/<devicetype>/<devicenumber>/setup` are both required by Alpaca — a conformance gap of its
+  own). `alpaca/src/setup_api.c` now serves one self-contained page (no CDN — the link-local USB network
+  has no internet route; dark/red for night vision) at both, plus the bare root. Camera facts on it are
+  fetched from the existing Alpaca API by the page itself rather than re-derived server-side — two sources
+  of truth is what swapped red/blue in the Bayer offsets — and the toggle drives the same
+  `PUT /api/v1/switch/0/setswitch` a Switch-aware client would. Root is registered as `"/$"`, not `"/"`:
+  as a civetweb *pattern* a bare `"/"` prefix-matches every URL, which would make unknown `/api/v1/...`
+  paths return HTML instead of a JSON error. Verified over the real RNDIS link in a real browser: all four
+  URLs serve the page with an exact `Content-Length`, API routing unaffected, no console errors, and a
+  click in the browser flipped the real device (`getswitch` false, `/userdata/dewheater.state` 0, daemon
+  logged it) and back.
 - `common_dispatch()` now takes a `common_device_t` (per-device name/description/interface version and its
   own `Connected` flag) instead of being hardwired to the camera; `parse_request_params()` moved to
   `http_util.h` so both dispatchers share it.
@@ -596,19 +615,43 @@ Working style for this project: prefer empirical validation over guessing (measu
 dark frames as ground truth); push back on unverified fixes offered as definitive — get the actual
 measurement or check.
 
-Open next steps: (1) commit the current working-tree changes (dimension-order/`Type`/`Rank` `imagearray`
-fix, Int16-safe gain scale, persistent V4L2 device incl. the two settling fixes, latency instrumentation,
-dhcpcd `usb0` timeout) — all now hardware-verified this session (direct HTTP/log-based testing), nothing
-since the "Confirm ImageBytes and exposure fixes" commit has been committed yet; (2) retest against a real
-SharpCap/N.I.N.A./PHD2 session — this session verified correctness via direct HTTP calls and log
-inspection, not a live ASCOM client, though the underlying data is now confirmed correct so this is
-expected to just work; (3) re-run the boot-time measurement to check the `quiet` bootarg's real effect,
-now that a board is connected; (4) the cache-blocked transpose fix for `send_imagebytes()`'s pixel-pack
-loop (~4x the cost of the actual network write) — the other half of the per-frame latency work, still not
-started, and now the largest *unfixed* latency item; (5) push the SC3336 exposure ceiling as far as it
-goes — the go/no-go signal for long exposures, and note the Alpaca driver's `ExposureMax` already tracks
-this automatically once it moves; (6) optional follow-up: disable ISP/RGA/MPP/NPU/audio in kernel Kconfig
-too (they currently still compile, just aren't loaded) for a further flash-size cut; (7) separately, a
-custom SPI NAND board config for the 64–128MB deployment target — not started, independent of the SD_CARD
-debloat above; this is also where Rockchip's thunderboot fast-boot feature becomes applicable; (8) longer
-term, retarget the whole stack to RV1106G3 (256MB RAM) once validated on RV1103.
+## Where this stands (end of session, 2026-09-16)
+
+**Working tree is clean.** Everything through the setup page (`alpaca/src/setup_api.{c,h}`, the
+`switch_api` accessors it needs, its registration in `main.c`, the refreshed overlay binary, and this
+documentation pass) is committed as the tip of `main`: "Serve a setup page so the dew heater is reachable
+from PHD2". All of it is hardware-verified.
+
+The board and the `overlay-luckfox-astroguider` copy of `alpacad` are both running the exact binary
+these sources build (md5 confirmed identical on both sides), so a reflash reproduces what was tested.
+Note the live SD card may still be newer than the last full `./build.sh ... firmware` output — run a
+fresh full build before trusting `output/image/sd_update.img`.
+
+Open next steps, roughly in order of value:
+
+1. **Retest against a live PHD2 / N.I.N.A. / SharpCap session.** All three worked as of the previous
+   session; this session's changes are additive (a new HTML page on previously-404 URLs) and were
+   verified over the real RNDIS link with API routing confirmed unaffected, but no ASCOM client has run
+   since. The specific thing to confirm is that PHD2's camera **Settings** button now lands on the setup
+   page and its dew-heater toggle.
+2. **Run the ASCOM Conformance tool.** Never done. It probes edge cases hand-testing does not, and the
+   driver now has two devices plus the setup URLs it expects.
+3. **Binning / subframing** — the largest remaining latency lever by a wide margin (2x2 would cut the
+   265ms `mg_write` to ~66ms). Blocked on a design decision, not on effort: SC3336 is Bayer so binning a
+   quad mixes colour channels; the production IMX290 is mono, where it is trivial. `ReadoutModes` is the
+   right ASCOM mechanism to expose it (see `alpaca/README.md`).
+4. **Re-run the boot-time measurement** to check the `quiet` bootarg's real effect — build-verified only,
+   never timed on hardware. Same for the `dhcpcd usb0 { timeout 1 }` override and the 15-20s
+   boot-to-discoverable delay.
+5. **Unpin gain.** Gain is still pinned at 128 (1x) and client gain PUTs are accepted but ignored; the
+   Int16-safe 0..1000 scale and its 32x practical ceiling are already implemented behind it.
+6. Optional: disable ISP/RGA/MPP/NPU/audio in **kernel Kconfig** too (they still compile, just are never
+   loaded) for a further flash-size cut.
+7. A custom **SPI NAND board config** for the 64-128MB deployment target — not started, independent of
+   the SD_CARD debloat. This is also where Rockchip's thunderboot fast-boot feature becomes applicable.
+8. Longer term, **retarget the whole stack to RV1106G3** (256MB RAM) once validated on RV1103.
+
+Closed since this list was last rewritten, so nobody re-opens them: the SC3336 exposure ceiling question
+(answered — ~0.899s, and `ExposureMax` tracks it live); the `send_imagebytes()` transpose cost (fixed,
+then fused into the unpack); the real-link `mg_write` measurement (265ms, ~22.5MB/s); and the SharpCap
+black-image bug (the `ImageElementType` fix).
