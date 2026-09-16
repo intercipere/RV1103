@@ -10,6 +10,7 @@
 #include "device_state.h"
 #include "discovery.h"
 #include "management_api.h"
+#include "switch_api.h"
 #include "v4l2_capture.h"
 
 #define ALPACA_TCP_PORT 11111
@@ -42,6 +43,11 @@ int main(void) {
 		return 1;
 	}
 
+	/* Restores the persisted dew-heater state and drives its GPIO before any
+	 * client can connect, so the heater comes back on by itself after a power
+	 * cycle rather than waiting to be re-enabled. */
+	switch_api_init();
+
 	discovery_start(ALPACA_TCP_PORT);
 
 	const char *options[] = {"listening_ports", "11111", "num_threads", "4",
@@ -58,6 +64,7 @@ int main(void) {
 
 	management_api_register(ctx);
 	camera_api_register(ctx);
+	switch_api_register(ctx);
 
 	printf("alpacad listening on :%d (discovery UDP :32227)\n", ALPACA_TCP_PORT);
 	for (;;)

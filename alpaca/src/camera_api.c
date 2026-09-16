@@ -13,27 +13,6 @@
 #include <strings.h>
 #include <time.h>
 
-/* Reads the PUT body (application/x-www-form-urlencoded) into `params`,
- * merging in any query-string parameters too -- Alpaca clients are only
- * required to use the body for PUT, but tolerating both is harmless and
- * matches how permissive real-world clients tend to be. */
-static void parse_request_params(struct mg_connection *conn, params_t *out) {
-	const struct mg_request_info *ri = mg_get_request_info(conn);
-	params_parse(ri->query_string, out);
-
-	if (strcasecmp(ri->request_method, "PUT") == 0) {
-		char body[2048];
-		int n = mg_read(conn, body, sizeof(body) - 1);
-		if (n > 0) {
-			body[n] = '\0';
-			params_t body_params;
-			params_parse(body, &body_params);
-			for (int i = 0; i < body_params.count && out->count < PARAMS_MAX; i++)
-				out->params[out->count++] = body_params.params[i];
-		}
-	}
-}
-
 /* Monotonic milliseconds, for precisely timing where per-request latency
  * actually goes (V4L2 setup/capture overhead vs. HTTP serialization/
  * transfer) instead of guessing -- prefixed onto every log line below. */
@@ -549,7 +528,15 @@ static int camera_dispatch(struct mg_connection *conn, void *cbdata) {
 		fprintf(stderr, "]\n");
 	}
 
-	if (common_dispatch(conn, member, ri->request_method, &params,
+	const common_device_t dev = {
+	    .description = "OpenAstroGuider raw V4L2 camera",
+	    .driverinfo = "OpenAstroGuider Alpaca camera driver (alpacad)",
+	    .interface_version = 3, /* ICameraV3 */
+	    .name = g_device.sensor->display_name,
+	    .connected = &g_device.connected,
+	    .lock = &g_device.lock,
+	};
+	if (common_dispatch(conn, &dev, member, ri->request_method, &params,
 	                     client_txn_id))
 		return 200;
 

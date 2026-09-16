@@ -1008,3 +1008,68 @@ ipv4.method link-local`, which auto-connects from then on.
 Note this forks the vendor `S50usbdevice` into the overlay (as the overlay already does for `RkLunch.sh`
 and `insmod_ko.sh`); there is no config-file hook for MACs — `parse_parameter()` only understands the
 `ums_*` keys.
+
+## Cooling: not a copied remnant, and not removable (2026-09-16)
+
+Asked whether the camera's cooling setting was left over from some ASCOM example.
+It is not. `CanSetCCDTemperature` and `CanGetCoolerPower` are **mandatory members of ASCOM's ICameraV3
+interface** -- every conformant camera driver has to answer them -- and this driver answers `false`.
+Everything else cooling-related already reports NotImplemented, verified live:
+
+```
+cooleron / coolerpower / ccdtemperature / setccdtemperature / heatsinktemperature
+    -> ErrorNumber 1024 (0x400, NotImplemented)
+cansetccdtemperature / cangetcoolerpower -> false
+```
+
+So the driver already declares "no cooler" as loudly as the interface permits; a client still drawing a
+cooling panel is making its own UI choice, and the controls should be inert. Removing those two members
+would make the driver *less* conformant, not cleaner.
+
+## Dew heater: an Alpaca Switch device (2026-09-16, hardware-verified)
+
+The OpenAstroGuider has a strip heater on the lens. ASCOM's Camera interface has no dew-heater member, so
+there is nowhere legitimate to put it there -- but ASCOM's **Switch** interface (ISwitchV2) exists for
+exactly this kind of auxiliary control, and one Alpaca server can host several devices. The heater is
+therefore a second device at `/api/v1/switch/0/`, enumerated alongside the camera in
+`/management/v1/configureddevices`, which SharpCap and N.I.N.A. surface in their existing Switch UI with
+no custom support needed.
+
+Exposed as a plain on/off switch (`MinSwitchValue=0`, `MaxSwitchValue=1`, `SwitchStep=1` -- how ISwitchV2
+describes a boolean device), per project decision: a percentage would have needed PWM, and
+`/sys/class/pwm` is not exported on this kernel (it would need a `pwm` DTS node plus `CONFIG_PWM_SYSFS`).
+The value members (`getswitchvalue`/`setswitchvalue`) mirror the boolean ones over 0..1, since ASCOM
+clients may drive a switch either way.
+
+**Persistence.** The heater state is stored in `/userdata/dewheater.state` (the board's persistent ext4
+partition, reserved for config -- `/tmp` is a RAM disk and would lose it on every power cut) and restored
+*and re-applied to the GPIO* by `switch_api_init()` before the HTTP server starts. An unattended rig does
+not need someone to re-tick a box after a power cycle. Written with `fsync()` before close, because this
+board is USB-bus-powered and "unplug" is an unclean power cut -- the same trap that once zeroed a pushed
+`alpacad` binary.
+
+**GPIO binding.** The pin is board wiring, not a user setting, and is unknown until the custom PCB exists.
+It is read from `OAG_DEWHEATER_GPIO` (documented and commented out in `S60alpacad`, so no rebuild is
+needed to bind it) and driven through `/sys/class/gpio`. Unset, the switch remains a fully working logical
+control that drives nothing -- which is what let the Alpaca side be finished and tested before the
+hardware exists.
+
+Verified on hardware: device enumeration, all ISwitchV2 metadata, on/off via both `setswitch` and
+`setswitchvalue`, invalid id and out-of-range value both rejected with 0x401, and **state restored as ON
+across a real reboot**. All three GPIO failure modes degrade gracefully without taking the daemon down:
+
+```
+OAG_DEWHEATER_GPIO=9999 -> export failed  -> "gpio 9999 UNAVAILABLE"
+OAG_DEWHEATER_GPIO=118  -> pin held by leds-gpio, direction failed -> "gpio 118 UNAVAILABLE"
+OAG_DEWHEATER_GPIO=abc  -> "ignoring malformed"
+(unset)                 -> "no pin set"
+```
+
+The success path (a real pin actually toggling) is **not** verified -- only three GPIOs are claimed on this
+board (audio PA, sensor `pwdn`, work LED) and driving an arbitrary unrouted pin on hardware that cannot be
+observed is not worth the risk. That test belongs with the PCB.
+
+`common_dispatch()` now takes a `common_device_t` (name, description, interface version, and its own
+`Connected` flag + lock) instead of being hardwired to the camera, since ASCOM clients connect to each
+device independently. `parse_request_params()` moved from `camera_api.c` into `http_util.h` so both
+dispatchers share one copy.

@@ -31,11 +31,17 @@ static int h_description(struct mg_connection *conn, void *cbdata) {
 
 static int h_configureddevices(struct mg_connection *conn, void *cbdata) {
 	(void)cbdata;
-	char buf[512];
+	char buf[768];
+	/* Two devices on one Alpaca server: the camera, and a Switch device for
+	 * the lens dew heater (ASCOM's Camera interface has nowhere to put a
+	 * heater, and Switch is the interface intended for auxiliary controls).
+	 * Clients enumerate and connect to each independently. */
 	alpaca_response(
 	    buf, sizeof(buf),
 	    "[{\"DeviceName\":\"OpenAstroGuider Camera\",\"DeviceType\":\"Camera\","
-	    "\"DeviceNumber\":0,\"UniqueID\":\"openastroguider-camera-0\"}]",
+	    "\"DeviceNumber\":0,\"UniqueID\":\"openastroguider-camera-0\"},"
+	    "{\"DeviceName\":\"OpenAstroGuider Dew Heater\",\"DeviceType\":\"Switch\","
+	    "\"DeviceNumber\":0,\"UniqueID\":\"openastroguider-switch-0\"}]",
 	    client_txn_from(conn), 0, "");
 	send_json(conn, buf);
 	return 200;

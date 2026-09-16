@@ -5,6 +5,15 @@
 # Alpaca discovery/HTTP API relies on are already up. See ../../alpaca/README.md
 # in the repo (not shipped on-device) for what this actually does.
 
+# Dew heater GPIO. The lens heater is exposed to ASCOM clients as an Alpaca
+# Switch device (/api/v1/switch/0/); this is the only place its physical pin is
+# named. Unset on the Luckfox prototype -- which has no heater wired -- so the
+# switch is a logical, persisted control that drives nothing. Set it to the
+# sysfs GPIO number on the custom PCB, e.g.:
+#   export OAG_DEWHEATER_GPIO=118
+# The heater's on/off state itself lives in /userdata/dewheater.state and is
+# restored at startup, so it survives a power cycle without a client.
+
 DAEMON=/usr/bin/alpacad
 LOG=/tmp/alpacad.log
 

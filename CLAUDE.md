@@ -516,6 +516,28 @@ matches, including partial-band/partial-tile dimensions). Two related changes in
   host interface now permanently `enx02217ab8e83f`. Low-risk: vendor `test_write` is
   `test -e $2 && echo $1 > $2`, so a rejected write changes nothing. Host side: one-time
   `nmcli con add type ethernet con-name oag-usb ifname enx02217ab8e83f ipv4.method link-local`.
+- **Cooling is not a copied remnant and should not be removed (2026-09-16).** `CanSetCCDTemperature` and
+  `CanGetCoolerPower` are mandatory `ICameraV3` members; the driver answers `false`, and
+  `cooleron`/`coolerpower`/`ccdtemperature`/`setccdtemperature`/`heatsinktemperature` all return
+  `ErrorNumber 1024` (0x400 NotImplemented) — verified live. A client drawing a cooling panel anyway is
+  making its own UI choice. Deleting those members would make the driver less conformant.
+- **Dew heater added as an Alpaca Switch device (2026-09-16, hardware-verified).** ASCOM's Camera
+  interface has no dew-heater member; Switch (ISwitchV2) is the interface meant for auxiliary controls,
+  and one Alpaca server can host several devices. Lives at `/api/v1/switch/0/`, enumerated alongside the
+  camera, so SharpCap/N.I.N.A. show it in their existing Switch UI. Plain on/off
+  (`Min=0 Max=1 Step=1`) by project decision — a percentage would need PWM and `/sys/class/pwm` is not
+  exported (needs a `pwm` DTS node + `CONFIG_PWM_SYSFS`). **State persists in
+  `/userdata/dewheater.state`** (fsync'd; `/tmp` is a RAM disk) and is restored *and re-applied to the
+  GPIO* at startup, so it survives a power cycle with no client — verified across a real reboot. **GPIO
+  pin comes from `OAG_DEWHEATER_GPIO`** (documented in `S60alpacad`, no rebuild needed), driven via
+  `/sys/class/gpio`; unset it is a working logical control that drives nothing, which is what let this be
+  finished before the PCB exists. All GPIO failure modes (bad pin / pin held by another driver /
+  malformed) degrade gracefully and are verified. **The success path — a real pin toggling — is NOT
+  verified**; only 3 GPIOs are claimed on this board and driving an arbitrary unrouted pin wasn't worth
+  the risk. That test belongs with the PCB.
+- `common_dispatch()` now takes a `common_device_t` (per-device name/description/interface version and its
+  own `Connected` flag) instead of being hardwired to the camera; `parse_request_params()` moved to
+  `http_util.h` so both dispatchers share it.
 - **Remaining lever:** binning/subframe — the only thing that cuts the 265ms write, and much bigger:
   2x2 binning gives 1.5MB and a ~66ms write, ~200ms saved. IMX290 (production) is mono so 2x2 binning is
   trivial there; SC3336 is Bayer, so binning a quad mixes colour channels — a real design decision.

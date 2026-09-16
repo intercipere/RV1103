@@ -6,22 +6,22 @@
 #include <string.h>
 #include <strings.h>
 
-int common_dispatch(struct mg_connection *conn, const char *member,
-                     const char *method, const params_t *params,
-                     long client_txn_id) {
+int common_dispatch(struct mg_connection *conn, const common_device_t *dev,
+                     const char *member, const char *method,
+                     const params_t *params, long client_txn_id) {
 	char buf[512];
 
 	if (strcasecmp(member, "connected") == 0) {
 		if (strcasecmp(method, "PUT") == 0) {
 			int val = params_get_bool(params, "connected", 0);
-			pthread_mutex_lock(&g_device.lock);
-			g_device.connected = val;
-			pthread_mutex_unlock(&g_device.lock);
+			pthread_mutex_lock(dev->lock);
+			*dev->connected = val;
+			pthread_mutex_unlock(dev->lock);
 			alpaca_response(buf, sizeof(buf), NULL, client_txn_id, 0, "");
 		} else {
-			pthread_mutex_lock(&g_device.lock);
-			int val = g_device.connected;
-			pthread_mutex_unlock(&g_device.lock);
+			pthread_mutex_lock(dev->lock);
+			int val = *dev->connected;
+			pthread_mutex_unlock(dev->lock);
 			alpaca_response_bool(buf, sizeof(buf), val, client_txn_id);
 		}
 		send_json(conn, buf);
@@ -36,16 +36,14 @@ int common_dispatch(struct mg_connection *conn, const char *member,
 		return 1;
 	}
 	if (strcasecmp(member, "description") == 0) {
-		alpaca_response_string(buf, sizeof(buf),
-		                        "OpenAstroGuider raw V4L2 camera",
+		alpaca_response_string(buf, sizeof(buf), dev->description,
 		                        client_txn_id);
 		send_json(conn, buf);
 		return 1;
 	}
 	if (strcasecmp(member, "driverinfo") == 0) {
-		alpaca_response_string(
-		    buf, sizeof(buf), "OpenAstroGuider Alpaca camera driver (alpacad)",
-		    client_txn_id);
+		alpaca_response_string(buf, sizeof(buf), dev->driverinfo,
+		                        client_txn_id);
 		send_json(conn, buf);
 		return 1;
 	}
@@ -68,16 +66,13 @@ int common_dispatch(struct mg_connection *conn, const char *member,
 		return 1;
 	}
 	if (strcasecmp(member, "interfaceversion") == 0) {
-		alpaca_response_int(buf, sizeof(buf), 3, client_txn_id); /* ICameraV3 */
+		alpaca_response_int(buf, sizeof(buf), dev->interface_version,
+		                     client_txn_id);
 		send_json(conn, buf);
 		return 1;
 	}
 	if (strcasecmp(member, "name") == 0) {
-		pthread_mutex_lock(&g_device.lock);
-		char name[128];
-		snprintf(name, sizeof(name), "%s", g_device.sensor->display_name);
-		pthread_mutex_unlock(&g_device.lock);
-		alpaca_response_string(buf, sizeof(buf), name, client_txn_id);
+		alpaca_response_string(buf, sizeof(buf), dev->name, client_txn_id);
 		send_json(conn, buf);
 		return 1;
 	}
