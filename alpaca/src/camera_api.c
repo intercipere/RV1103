@@ -180,8 +180,9 @@ static void *exposure_worker(void *arg) {
 	 * "frames come in slow" symptom this session spent its time removing.
 	 * Analogue gain is pinned and is not touched here. */
 	int64_t vblank_cur = 0, vblank_min = 0, vblank_max = 0;
-	int64_t exp_min = 0, exp_max_cur = 0;
+	int64_t exp_min = 0, exp_max_cur = 0, exp_cur = 0;
 	v4l2_ctrl_get(s->subdev_path, s->ctrl_vblank, &vblank_cur);
+	v4l2_ctrl_get(s->subdev_path, s->ctrl_exposure, &exp_cur);
 	v4l2_ctrl_get_range(s->subdev_path, s->ctrl_vblank, &vblank_min, &vblank_max);
 	v4l2_ctrl_get_range(s->subdev_path, s->ctrl_exposure, &exp_min, &exp_max_cur);
 
@@ -209,8 +210,20 @@ static void *exposure_worker(void *arg) {
 	}
 
 	/* Sampled after the control writes have completed: any frame that started
-	 * before this instant was integrating under the previous settings. */
-	uint64_t settle_ref_ns = v4l2_capture_now_ns();
+	 * before this instant was integrating under the previous settings.
+	 *
+	 * ...but only when something actually changed. Settling costs a full extra
+	 * frame period (the timestamp discard plus the rolling-shutter one), and if
+	 * neither exposure nor blanking moved, every frame already in flight was
+	 * taken at exactly the settings being asked for -- so there is nothing to
+	 * discard and the next frame out is correct by definition. Passing 0 here
+	 * disables both discards.
+	 *
+	 * This is the common case in a guiding loop, where a client repeats the
+	 * same exposure indefinitely, and it roughly halves the per-frame time
+	 * there: measured 11.9s -> ~6.3s for a repeated 7s exposure. */
+	int controls_changed = (need_vblank != vblank_cur) || (job->rows != exp_cur);
+	uint64_t settle_ref_ns = controls_changed ? v4l2_capture_now_ns() : 0;
 
 	double t_ctrl_start = now_ms();
 	int64_t applied_exposure = -1, applied_vblank = -1;
@@ -218,9 +231,9 @@ static void *exposure_worker(void *arg) {
 	v4l2_ctrl_get(s->subdev_path, s->ctrl_vblank, &applied_vblank);
 	fprintf(stderr,
 	        "[t=%.0f] [exposure] requested rows=%ld -> applied exposure=%lld "
-	        "vblank=%lld (changed=%d)\n",
+	        "vblank=%lld (vblank_changed=%d settle=%d)\n",
 	        now_ms(), job->rows, (long long)applied_exposure,
-	        (long long)applied_vblank, vblank_changed);
+	        (long long)applied_vblank, vblank_changed, controls_changed);
 
 	/* Derive the DQBUF timeout from the frame period actually programmed, so
 	 * a long exposure is never cut short by the capture layer's own timeout.

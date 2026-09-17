@@ -753,9 +753,58 @@ derives from it stays consistent.
 Note that at 93.5s the DQBUF timeout's 120s backstop (`v4l2_capture.c`) is uncomfortably close to a single
 frame period. It works, but living near the 52x ceiling would want that raised.
 
+## Row time was wrong by 12%, and the settle discard was paid unconditionally (2026-09-17)
+
+Triggered by a user report that a 7s exposure "takes almost 5s for the image to arrive". Both halves of
+that turned out to be real, and independent of each other.
+
+**1. `hts_def` is wrong in the vendor mode table, so every exposure was ~12% short.** Userspace derives
+row time as `(width + h_blank) / pixel_rate`, and `h_blank` comes from `hts_def`. Measured directly with
+`v4l2-ctl --stream-count` at three `vertical_blanking` values spanning 5x:
+
+```
+vblank=64   -> vts=1360 -> 30.00 fps -> 24.510 us/row
+vblank=2000 -> vts=3296 -> 12.38 fps -> 24.507 us/row
+vblank=6000 -> vts=7296 ->  5.59 fps -> 24.519 us/row
+```
+
+`hts_def` (2800) / pixel_rate (102 MHz) claims **27.451 us/row** — 12% high. **The long-standing
+"~27.45 us/row" figure in this file was never independently validated; it was derived from `hts_def` and
+then checked only against other numbers derived from `hts_def`.** Consequences: a requested 7s exposure
+was really 6.25s, and `ExposureMax` was overstated by 12% at every `hts_mult`.
+
+The mode table's own `max_fps` and `vts_def` fields are self-consistent and correct:
+`pixel_rate / (max_fps * vts_def)` gives **2500** for mode 0 and 2499 for mode 1, matching the
+measurement exactly. (It also matches the HTS register, which reads 1250 and is evidently in 2-pixel
+units.) `sc3336_true_hts()` now computes it that way; the bogus `hts_def` is left alone rather than
+editing vendor data other code may compare against. `ExposureMax` at `hts_mult=12` is now an honest
+**19.27s** (was a claimed 21.59s), `exposuremin` reports 294.12 us, and a 7s request now programs 23800
+rows instead of 21250.
+
+Note this also invalidates the earlier "verification" of the HTS lever at 2x, where 9107 rows took ~448ms
+against a predicted 500ms — that 10% shortfall was this same bug, and it was read as agreement rather
+than as the discrepancy it was.
+
+**2. The settle discard was paid even when nothing changed.** The stale-frame fix costs a full extra
+frame period (timestamp discard + rolling-shutter discard). That is necessary when exposure or blanking
+just moved — but if neither changed, every frame already in flight was taken at exactly the requested
+settings, so there is nothing to discard. `exposure_worker()` now compares the requested rows and
+computed blanking against the values actually programmed, and passes `settle_ref_ns = 0` when they match,
+which disables both discards.
+
+This is the common case in a guiding loop, where a client repeats one exposure indefinitely. Measured for
+a repeated 7s exposure: **11.9s -> 6.3s**, i.e. down to essentially one frame period, which is the floor.
+Correctness checked by comparing a `settle=1` and a `settle=0` capture of the same 0.5s exposure: means
+1022.9 and 1022.9, identical. The log line now reports `settle=` alongside `vblank_changed=`.
+
+So the user's "almost 5s" was the unconditional discard, and the 7s that was really 6.25s was the row-time
+bug. Both fixed.
+
 ## Where this stands (end of session, 2026-09-17)
 
 **Working tree is clean** apart from an untracked `PCB/` directory, which is not mine and was left alone.
+Row time is now measured-correct (24.51 us/row at `hts_mult=1`, 294.12 us at 12) — treat any older
+"27.45 us/row" reference in this file as wrong.
 The long-exposure work (raised `SC3336_VTS_MAX`, `hts_mult` row-time scaling at 12x, the scaled DQBUF
 timeout, the timestamp+rolling-shutter stale-frame fix, the direct usb0 link-local assignment, the
 refreshed overlay binary, and this documentation pass) is committed at the tip of `main`. All of it is

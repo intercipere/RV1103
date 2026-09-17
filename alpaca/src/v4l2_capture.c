@@ -445,6 +445,7 @@ int v4l2_capture_frame(v4l2_frame_t *out, double frame_period_s,
 			return -1;
 		}
 	}
+	uint64_t first_fresh_ns = ts_ns;
 	if (settle_ref_ns != 0) {
 		if (qbuf_index((unsigned)idx) < 0)
 			return -1;
@@ -453,6 +454,16 @@ int v4l2_capture_frame(v4l2_frame_t *out, double frame_period_s,
 		if (idx < 0)
 			return -1;
 	}
+	/* How long after the control writes the returned frame actually began
+	 * readout. Anything much less than one frame period means the frame did
+	 * not integrate for the full requested time -- the exact failure this
+	 * discard logic exists to prevent, and not otherwise visible when the
+	 * scene is saturated (frame means are then identical regardless). */
+	if (settle_ref_ns != 0 && ts_ns != 0)
+		fprintf(stderr,
+		        "[v4l2] frame_start_after_ctrl=%.0fms (first_fresh=%.0fms)\n",
+		        (double)(ts_ns - settle_ref_ns) / 1e6,
+		        (double)(first_fresh_ns - settle_ref_ns) / 1e6);
 	double t_discard = now_ms();
 	double t_dqbuf = t_discard;
 

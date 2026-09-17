@@ -529,6 +529,11 @@ static const struct sc3336_mode supported_modes[] = {
 	}
 };
 
+static const s64 link_freq_menu_items[] = {
+	SC3336_LINK_FREQ_253,
+	SC3336_LINK_FREQ_255,
+};
+
 /* Clamped accessor: hts_mult comes from a module parameter, so it can be any
  * int. h_blank is computed as (eff_hts - width) into an unsigned control range,
  * so a zero or negative multiplier would underflow into a nonsense blanking
@@ -542,15 +547,53 @@ static int sc3336_clamped_hts_mult(void)
 	return sc3336_hts_mult;
 }
 
-static u32 sc3336_eff_hts(const struct sc3336_mode *mode)
+/*
+ * The mode table's hts_def is WRONG, and userspace depends on it: h_blank is
+ * reported as (hts - width), and clients derive row time as
+ * (width + h_blank) / pixel_rate to convert an exposure in seconds into rows.
+ *
+ * Measured on real hardware (2026-09-17) with `v4l2-ctl --stream-count`, at
+ * three vertical_blanking values spanning 5x:
+ *
+ *   vblank=64   -> vts=1360 -> 30.00 fps -> 24.510 us/row
+ *   vblank=2000 -> vts=3296 -> 12.38 fps -> 24.507 us/row
+ *   vblank=6000 -> vts=7296 ->  5.59 fps -> 24.519 us/row
+ *
+ * hts_def (2800) / pixel_rate (102 MHz) claims 27.451 us/row -- 12% high, so
+ * every exposure came out ~12% shorter than requested and ExposureMax was
+ * overstated by the same factor.
+ *
+ * The mode table's OWN max_fps and vts_def fields are self-consistent and
+ * correct: pixel_rate / (max_fps * vts_def) gives 2500 for mode 0 and 2499 for
+ * mode 1, matching the measurement. (It also matches the HTS register, which
+ * reads 1250 and is evidently in 2-pixel units -- but deriving it from the mode
+ * table needs no I2C read and works before streaming starts.) So compute the
+ * real HTS from those, and leave the bogus hts_def alone rather than editing
+ * vendor data that other code may compare against.
+ *
+ * Overflow: max_fps.denominator * vts_def is 300000 * 1360 = 4.08e8 for mode 0,
+ * within u32; vts_def is ~1360-1620 for every mode here.
+ */
+static u32 sc3336_true_hts(const struct sc3336_mode *mode)
 {
-	return mode->hts_def * (u32)sc3336_clamped_hts_mult();
+	/* Cast to u32 before dividing: link_freq_menu_items is s64, and a 64-bit
+	 * division pulls in __aeabi_ldivmod, which is not available to modules on
+	 * 32-bit ARM. The values (253/255 MHz) fit u32 with room to spare, and so
+	 * does the 1.02e9 intermediate. */
+	u32 pixel_rate = (u32)link_freq_menu_items[mode->link_freq_idx] /
+			 SC3336_BITS_PER_SAMPLE * 2 * SC3336_LANES;
+	u32 rows_per_sec = (mode->max_fps.denominator * mode->vts_def) /
+			   mode->max_fps.numerator;
+
+	if (!rows_per_sec)
+		return mode->hts_def; /* cannot happen with this table; be safe */
+	return pixel_rate / rows_per_sec;
 }
 
-static const s64 link_freq_menu_items[] = {
-	SC3336_LINK_FREQ_253,
-	SC3336_LINK_FREQ_255,
-};
+static u32 sc3336_eff_hts(const struct sc3336_mode *mode)
+{
+	return sc3336_true_hts(mode) * (u32)sc3336_clamped_hts_mult();
+}
 
 static const char * const sc3336_test_pattern_menu[] = {
 	"Disabled",
