@@ -1,20 +1,73 @@
 #!/bin/sh
 #
-# OpenAstroGuider: undo S50usbdevice's hardcoded static IP (172.32.0.70) on
-# usb0, so dhcpcd's own DHCP-then-IPv4LL fallback becomes the final,
-# authoritative address instead. dhcpcd is already running (started by
-# S41dhcpcd) and already correctly implements RFC 3927 link-local
-# self-assignment for exactly this case (no DHCP server on a point-to-point
-# link) -- confirmed via its own log: "probing for an IPv4LL address" ->
-# "using IPv4LL address 169.254.x.x" -> "adding route to 169.254.0.0/16".
-# Windows/macOS/Linux all self-assign a compatible 169.254.0.0/16 address
-# automatically in this situation, so no user-side IP configuration is
-# needed on any OS. The Alpaca discovery UDP broadcast (port 32227)
-# doesn't care what the specific address ends up being.
+# OpenAstroGuider: give usb0 its IPv4 link-local address immediately, instead
+# of letting dhcpcd negotiate one.
+#
+# History, so nobody re-litigates this. S50usbdevice hardcodes 172.32.0.70,
+# which required every connecting PC to be manually given a matching static
+# address -- a real production problem. That was replaced by simply clearing
+# the address and letting dhcpcd's DHCP-then-IPv4LL fallback pick one, which
+# worked but is slow. Measured on hardware (2026-09-17), from dhcpcd's log:
+#
+#   t=4s   usb0 carrier acquired
+#   t=6s   soliciting a DHCP lease
+#   t=11s  probing for an IPv4LL address   <- 5s of DHCP with no server present
+#   t=16s  using IPv4LL address            <- 5s of RFC 3927 probe/announce
+#
+# ~10 of those seconds are spent negotiating an address on a point-to-point
+# USB link that can never have a DHCP server on it, and it is the dominant
+# term in "how long until an ASCOM client can see the camera". The
+# `interface usb0 { timeout 1 }` override in etc/dhcpcd.conf was an attempt to
+# cut the DHCP half; it was measured and does NOT work -- dhcpcd falls back on
+# its DISCOVER retransmit schedule, not on `timeout`, so the phase is 5s either
+# way. That override has been removed rather than left in looking effective.
+#
+# So: assign the address directly and take dhcpcd out of the loop for usb0
+# (denyinterfaces usb0, in etc/dhcpcd.conf). dhcpcd still handles eth0.
+#
+# The address is DERIVED FROM THE GADGET MAC, which S50usbdevice pins to the
+# SoC chip serial -- so it is stable across reboots for a given board, and
+# distinct between boards, with no state to store. Clients do not need to know
+# it: Alpaca discovery is a UDP broadcast on port 32227, and Windows/macOS/
+# Linux all self-assign a compatible 169.254.0.0/16 address automatically, so
+# there is still zero user-side network configuration on any OS.
+#
+# Tradeoff, stated plainly: this skips RFC 3927's probe step, which exists to
+# detect an address already in use. On a point-to-point USB link there are
+# exactly two participants, and the PC side does probe -- so a collision would
+# be detected and resolved by the peer. The risk is a 1-in-65024 chance the PC
+# independently self-assigns this exact address, which its own probe would then
+# make it move away from.
+
+set_linklocal() {
+	MAC=$(cat /sys/class/net/usb0/address 2>/dev/null)
+	[ -n "$MAC" ] || return 1
+
+	# Last two MAC octets -> the host part of 169.254.0.0/16.
+	X=$((0x$(echo "$MAC" | cut -d: -f5)))
+	Y=$((0x$(echo "$MAC" | cut -d: -f6)))
+
+	# RFC 3927 reserves 169.254.0.0/24 and 169.254.255.0/24.
+	[ "$X" -lt 1 ] && X=1
+	[ "$X" -gt 254 ] && X=254
+
+	ip addr flush dev usb0 2>/dev/null
+	ip addr add "169.254.$X.$Y/16" broadcast 169.254.255.255 dev usb0 || return 1
+	ip link set usb0 up
+
+	# Also to kmsg, so `dmesg` carries a kernel-timestamped record of exactly
+	# when the camera became reachable. Boot-to-discoverable is a recurring
+	# question here and this is the one event that answers it; without it the
+	# only evidence was dhcpcd's log, which no longer touches this interface.
+	echo "usb0: 169.254.$X.$Y/16 (derived from $MAC)"
+	echo "OAG: usb0 link-local ready: 169.254.$X.$Y" > /dev/kmsg 2>/dev/null
+}
 
 case "$1" in
 	start)
-		ifconfig usb0 0.0.0.0
+		set_linklocal || echo "usb0: link-local assignment failed"
+		;;
+	stop)
 		;;
 	*)
 		exit 1

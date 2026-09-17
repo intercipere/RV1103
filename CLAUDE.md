@@ -583,10 +583,11 @@ has no route onto the board's real `usb0` RNDIS interface), not the real link a 
 a testing artifact pending a real-client remeasurement, not a confirmed regression. Full detail in
 `alpaca/README.md`, "Latency: conditional discard + cache-blocked transpose".
 
-**Boot-to-discoverable delay: dhcpcd `usb0` timeout fix added, not yet measured (2026-09-15).** `dhcpcd`
-always tries a real DHCP lease first on every interface, including `usb0` — a point-to-point USB RNDIS
-link that never has a DHCP server on the other end, so that solicit wastes several seconds before falling
-back to the IPv4LL self-assignment that's actually used (see the networking fix above). Added an
+**[SUPERSEDED — measured and it does not work; see "Boot-to-discoverable: measured and fixed properly"
+below] Boot-to-discoverable delay: dhcpcd `usb0` timeout fix added, not yet measured (2026-09-15).**
+`dhcpcd` always tries a real DHCP lease first on every interface, including `usb0` — a point-to-point USB
+RNDIS link that never has a DHCP server on the other end, so that solicit wastes several seconds before
+falling back to the IPv4LL self-assignment that's actually used (see the networking fix above). Added an
 `etc/dhcpcd.conf` overlay (`interface usb0 { timeout 1 }`) via the same `RK_POST_OVERLAY` mechanism.
 Verified it lands in the built rootfs; not yet rigorously timed before/after on hardware.
 
@@ -679,11 +680,86 @@ there: a stale frame costs one whole exposure, so at the multi-second exposures 
 chosen for, a 40% stale rate would be crippling. The fix is in the sensor-agnostic V4L2 layer, so it
 carries over unchanged.
 
+## Boot-to-discoverable: measured and fixed properly (2026-09-17)
+
+The question "why does it take several seconds before any program can see the ASCOM server" now has a
+measured answer. From the board's own `dhcpcd` log, before the fix:
+
+```
+t=4s   usb0 carrier acquired
+t=6s   soliciting a DHCP lease
+t=11s  probing for an IPv4LL address   <- 5s of DHCP on a link with no server
+t=16s  using IPv4LL address            <- 5s of RFC 3927 probe/announce
+```
+
+**~10 of those 16 seconds are spent negotiating an address on a point-to-point USB link that can never
+have a DHCP server on it.** The host PC then does its own IPv4LL self-assignment on top, which is
+additive and accounts for the rest of the 15-20s originally reported.
+
+Two things were wrong, both previously assumed fine:
+
+- **The `dhcpcd.conf` override was never actually running.** The overlay had it and the staged rootfs had
+  it, but the flashed SD card predated it — exactly the stale-image trap documented under the
+  hot-iteration workflow. The board had been running the stock Buildroot sample the whole time.
+- **It does not work anyway.** Pushed the correct file, rebooted, measured: the DHCP phase is **5s either
+  way**, an identical timeline. `interface usb0 { timeout 1 }` has no effect on when dhcpcd gives up and
+  falls back to IPv4LL — that follows its DISCOVER retransmit schedule, not `timeout`. The override has
+  been **removed** rather than left in place looking effective.
+
+**Fix: assign the address directly and take dhcpcd off `usb0` entirely.** `S51usb0-linklocal` now derives
+a `169.254.x.y` address from the gadget MAC (already pinned to the SoC chip serial by `S50usbdevice`), so
+it is stable per board, distinct between boards, and needs no stored state. `etc/dhcpcd.conf` gained
+`denyinterfaces usb0` so the two cannot fight — the static-vs-dhcpcd race is exactly how the original
+`172.32.0.70` problem manifested. `eth0` still uses dhcpcd normally.
+
+**Measured result: usb0 ready at t=6.39s instead of t=16s — ~9.6s saved.** The script now also writes
+`OAG: usb0 link-local ready: <addr>` to `/dev/kmsg`, so `dmesg` carries a kernel-timestamped record of the
+moment the camera becomes reachable; that is the one event that answers this recurring question, and
+dhcpcd's log no longer covers this interface.
+
+This is **not** a return to the old fixed IP. A `169.254/16` address still needs zero configuration on the
+client, because Windows/macOS/Linux all self-assign into the same range. The deliberate tradeoff is that
+it skips RFC 3927's probe step: on a two-participant USB link the collision risk is ~1 in 65024, the PC
+side still probes, and it would move away from a collision on its own.
+
+## HTS/row-time scaling shipped, default 12x (2026-09-17)
+
+`SC3336_VTS_MAX` is now at the VTS register's 16-bit maximum, so row time is the only remaining lever on
+the exposure ceiling (ceiling = VTS_MAX x row_time). `sc3336.ko` gained an `hts_mult` module parameter,
+**set in the overlay's `insmod_ko.sh`, not baked into the driver**, so it is changeable with no rebuild.
+
+Measured on real hardware:
+
+| `hts_mult` | row time | `ExposureMax` | verified | shortest capture (10ms request) |
+|---|---|---|---|---|
+| 1 (stock) | 27.5 us | 1.80s | — | ~0.2s |
+| **12 (shipped)** | **329 us** | **21.6s** | 15s, 20s | **~0.9s** |
+| 52 (max) | 1427 us | 93.5s | 30s, **85s** | ~4.2s |
+
+52 is the hard maximum: HTS is a 16-bit register and the base value reads back as 1250.
+
+**The cost is symmetrical and is the whole design decision:** row time scales the *minimum* frame period
+too, so a long ceiling makes short exposures slow. It hurts focusing and framing, not guiding, where the
+exposure itself dominates. 12 was chosen as the balance — 21.6s is already well past anything guiding
+needs, while ~0.9s for a short frame stays usable.
+
+**If this is ever redone, do not derive the HTS register value from `hts_def`.** They disagree: the
+register reads 1250 while `hts_def` is 2800 (ratio 2.24), and the mode table is not self-consistent about
+units either (one entry writes `0x0578 * 2`, the other a bare `0x05dc`). The driver reads the register
+back after the mode list is applied and scales *that*, which is what made the original experiment correct
+despite a wrong initial guess of 1400. `h_blank` is scaled by the same factor so the row time userspace
+derives from it stays consistent.
+
+Note that at 93.5s the DQBUF timeout's 120s backstop (`v4l2_capture.c`) is uncomfortably close to a single
+frame period. It works, but living near the 52x ceiling would want that raised.
+
 ## Where this stands (end of session, 2026-09-17)
 
-**Working tree is clean.** The long-exposure work (raised `SC3336_VTS_MAX`, the scaled DQBUF timeout, the
-timestamp+rolling-shutter stale-frame fix, the refreshed overlay binary, and this documentation pass) is
-committed as the tip of `main`. All of it is hardware-verified.
+**Working tree is clean** apart from an untracked `PCB/` directory, which is not mine and was left alone.
+The long-exposure work (raised `SC3336_VTS_MAX`, `hts_mult` row-time scaling at 12x, the scaled DQBUF
+timeout, the timestamp+rolling-shutter stale-frame fix, the direct usb0 link-local assignment, the
+refreshed overlay binary, and this documentation pass) is committed at the tip of `main`. All of it is
+hardware-verified.
 
 The board and the `overlay-luckfox-astroguider` copy of `alpacad` are both running the exact binary
 these sources build (md5 confirmed identical on both sides), so a reflash reproduces what was tested.
@@ -705,8 +781,10 @@ Open next steps, roughly in order of value:
    quad mixes colour channels; the production IMX290 is mono, where it is trivial. `ReadoutModes` is the
    right ASCOM mechanism to expose it (see `alpaca/README.md`).
 4. **Re-run the boot-time measurement** to check the `quiet` bootarg's real effect — build-verified only,
-   never timed on hardware. Same for the `dhcpcd usb0 { timeout 1 }` override and the 15-20s
-   boot-to-discoverable delay.
+   never timed on hardware. The `dhcpcd`/boot-to-discoverable half of this is now **done**: measured,
+   the `timeout 1` override disproved and removed, and ~9.6s cut by assigning usb0's address directly
+   (see above). What remains unmeasured is `quiet`, and the *host*-side IPv4LL delay, which is additive
+   and outside our control.
 5. **Unpin gain.** Gain is still pinned at 128 (1x) and client gain PUTs are accepted but ignored; the
    Int16-safe 0..1000 scale and its 32x practical ceiling are already implemented behind it.
 6. Optional: disable ISP/RGA/MPP/NPU/audio in **kernel Kconfig** too (they still compile, just are never
@@ -716,8 +794,9 @@ Open next steps, roughly in order of value:
 8. Longer term, **retarget the whole stack to RV1106G3** (256MB RAM) once validated on RV1103.
 
 Closed since this list was last rewritten, so nobody re-opens them: the SC3336 exposure ceiling question
-(answered twice — the driver-enforced 0.899s, then **1.799s** after raising `SC3336_VTS_MAX`, and up to
-10.79s with the throwaway HTS diagnostic); the hardcoded `DQBUF_TIMEOUT_MS` ceiling (now derived from the
+(answered — 0.899s stock, **1.799s** after raising `SC3336_VTS_MAX` to the register maximum, and
+**21.6s shipped** via `hts_mult=12`, with 93.5s available at the 52x maximum); the boot-to-discoverable
+delay (measured; `timeout 1` disproved, ~9.6s cut by direct link-local assignment); the hardcoded `DQBUF_TIMEOUT_MS` ceiling (now derived from the
 frame period, and the old 5s limit proven real by measurement); the stale-frame race (fixed by frame
 timestamps plus one rolling-shutter discard); the `send_imagebytes()` transpose cost (fixed, then fused
 into the unpack); the real-link `mg_write` measurement (265ms, ~22.5MB/s); and the SharpCap black-image

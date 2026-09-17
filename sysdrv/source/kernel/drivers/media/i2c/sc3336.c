@@ -67,6 +67,31 @@
  * exposures are the whole point of this build. */
 #define SC3336_VTS_MAX			0xffff
 
+/* Row time is HTS/pixel_rate, so scaling HTS scales the frame period and with
+ * it the exposure ceiling -- the only lever left now that SC3336_VTS_MAX is
+ * already at the VTS register's 16-bit maximum. The stock driver never writes
+ * HTS at all, leaving whatever the mode's register list and the sensor's
+ * power-on defaults produce.
+ *
+ * Measured ceilings on real hardware (2026-09-17): 1x -> 1.80s, 12x -> 21.6s,
+ * 52x -> 93.5s (52 is the maximum: HTS is a 16-bit register and the base value
+ * reads back as 1250). The cost is symmetrical -- the *minimum* frame period
+ * scales too, so a 10ms exposure takes ~0.2s at 1x but ~4.2s at 52x. The
+ * shipped value is chosen in the overlay's insmod_ko.sh, not here, so it can
+ * be changed without a rebuild; this default stays at stock behaviour.
+ *
+ * SC3336_MAX_HTS_MULT is a guard, not the sensor limit: the real bound is
+ * checked against the register width at stream start, where the actual base
+ * value is known. */
+#define SC3336_MAX_HTS_MULT		64
+
+static int sc3336_hts_mult = 1;
+module_param_named(hts_mult, sc3336_hts_mult, int, 0644);
+MODULE_PARM_DESC(hts_mult, "multiply HTS/row time by this, 1..64 (default 1)");
+
+#define SC3336_REG_HTS_H		0x320c
+#define SC3336_REG_HTS_L		0x320d
+
 #define SC3336_REG_DIG_GAIN		0x3e06
 #define SC3336_REG_DIG_FINE_GAIN	0x3e07
 #define SC3336_REG_ANA_GAIN		0x3e09
@@ -504,6 +529,24 @@ static const struct sc3336_mode supported_modes[] = {
 	}
 };
 
+/* Clamped accessor: hts_mult comes from a module parameter, so it can be any
+ * int. h_blank is computed as (eff_hts - width) into an unsigned control range,
+ * so a zero or negative multiplier would underflow into a nonsense blanking
+ * value rather than failing visibly. */
+static int sc3336_clamped_hts_mult(void)
+{
+	if (sc3336_hts_mult < 1)
+		return 1;
+	if (sc3336_hts_mult > SC3336_MAX_HTS_MULT)
+		return SC3336_MAX_HTS_MULT;
+	return sc3336_hts_mult;
+}
+
+static u32 sc3336_eff_hts(const struct sc3336_mode *mode)
+{
+	return mode->hts_def * (u32)sc3336_clamped_hts_mult();
+}
+
 static const s64 link_freq_menu_items[] = {
 	SC3336_LINK_FREQ_253,
 	SC3336_LINK_FREQ_255,
@@ -719,7 +762,7 @@ static int sc3336_set_fmt(struct v4l2_subdev *sd,
 #endif
 	} else {
 		sc3336->cur_mode = mode;
-		h_blank = mode->hts_def - mode->width;
+		h_blank = sc3336_eff_hts(mode) - mode->width;
 		__v4l2_ctrl_modify_range(sc3336->hblank, h_blank,
 					 h_blank, 1, h_blank);
 		vblank_def = mode->vts_def - mode->height;
@@ -900,7 +943,7 @@ static long sc3336_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 				hdr->hdr_mode, w, h);
 			ret = -EINVAL;
 		} else {
-			w = sc3336->cur_mode->hts_def - sc3336->cur_mode->width;
+			w = sc3336_eff_hts(sc3336->cur_mode) - sc3336->cur_mode->width;
 			h = sc3336->cur_mode->vts_def - sc3336->cur_mode->height;
 			__v4l2_ctrl_modify_range(sc3336->hblank, w, w, 1, w);
 			__v4l2_ctrl_modify_range(sc3336->vblank, h,
@@ -1021,6 +1064,46 @@ static int __sc3336_start_stream(struct sc3336 *sc3336)
 		ret = sc3336_write_array(sc3336->client, sc3336->cur_mode->reg_list);
 		if (ret)
 			return ret;
+
+		if (sc3336_clamped_hts_mult() > 1) {
+			u32 hts_h = 0, hts_l = 0, base, want;
+			int mult = sc3336_clamped_hts_mult();
+
+			/* Read the register back and scale THAT, rather than
+			 * deriving it from mode->hts_def. The two do not agree:
+			 * hts_def is 2800 for this mode while the register reads
+			 * 1250, a ratio of 2.24, and the mode table is not even
+			 * self-consistent about units (one entry writes
+			 * `0x0578 * 2`, the other a bare `0x05dc`). Scaling the
+			 * measured value keeps the ratio correct regardless of
+			 * what the units actually are -- and h_blank is scaled by
+			 * the same factor, so the row time userspace derives from
+			 * it stays consistent with the sensor. */
+			ret = sc3336_read_reg(sc3336->client, SC3336_REG_HTS_H,
+					      SC3336_REG_VALUE_08BIT, &hts_h);
+			ret |= sc3336_read_reg(sc3336->client, SC3336_REG_HTS_L,
+					       SC3336_REG_VALUE_08BIT, &hts_l);
+			if (ret)
+				return ret;
+			base = (hts_h << 8) | hts_l;
+			want = base * (u32)mult;
+			dev_info(&sc3336->client->dev,
+				 "OAG: HTS base=%u mult=%d -> %u\n",
+				 base, mult, want);
+			if (want > 0xffff) {
+				dev_err(&sc3336->client->dev,
+					"OAG: HTS %u exceeds 16-bit register\n",
+					want);
+				return -EINVAL;
+			}
+			ret = sc3336_write_reg(sc3336->client, SC3336_REG_HTS_H,
+					       SC3336_REG_VALUE_08BIT, want >> 8);
+			ret |= sc3336_write_reg(sc3336->client, SC3336_REG_HTS_L,
+						SC3336_REG_VALUE_08BIT, want & 0xff);
+			if (ret)
+				return ret;
+		}
+
 		/* In case these controls are set before streaming */
 		ret = __v4l2_ctrl_handler_setup(&sc3336->ctrl_handler);
 		if (ret)
@@ -1454,7 +1537,7 @@ static int sc3336_initialize_controls(struct sc3336 *sc3336)
 
 	__v4l2_ctrl_s_ctrl(sc3336->link_freq, dst_link_freq);
 
-	h_blank = mode->hts_def - mode->width;
+	h_blank = sc3336_eff_hts(mode) - mode->width;
 	sc3336->hblank = v4l2_ctrl_new_std(handler, NULL, V4L2_CID_HBLANK,
 					    h_blank, h_blank, 1, h_blank);
 	if (sc3336->hblank)
