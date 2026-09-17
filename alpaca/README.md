@@ -1247,3 +1247,62 @@ from `hts_def`.
 capture layer no matter what the sensor supported. `v4l2_capture_frame()` now takes `frame_period_s` and
 derives the timeout from it (3x period + 5s floor, 120s backstop), computed in `exposure_worker()` from
 the *applied* vblank so it tracks whatever is actually programmed.
+
+
+## Exposure abort: advertised, not implemented — OPEN (2026-09-17)
+
+Reported in SharpCap: start a 19s exposure, move the slider to 0.5s mid-exposure, and the 0.5s frame
+takes a very long time. Reproduced over the API — the 0.5s frame arrived **16.6s** after it was requested.
+
+Nothing below is fixed. Three problems, and only the last one explains the delay.
+
+### 1. Abort does not abort
+
+`camera_api.c`'s `stopexposure`/`abortexposure` handler sets `g_device.state = CAM_IDLE` and returns
+success. There is no mid-capture cancellation, and the comment there says so. But `canabortexposure` and
+`canstopexposure` both report **true**, so a client is entitled to assume the abort took effect. The
+worker thread remains blocked in `dqbuf_wait()` for up to a full frame period.
+
+### 2. Two workers can share the V4L2 device
+
+`startexposure` refuses only when `state == CAM_EXPOSING`, and the abort has just cleared that — so a
+second `exposure_worker` is created while the first is still inside `v4l2_capture_frame()`. Both use the
+same fd and the same mmap'd buffer pool. `g_ctrl_lock` protects only `v4l2_ctrl_get`/`v4l2_ctrl_set`; the
+capture path has no mutex.
+
+The log for the reproduction shows both workers starting and only one capture finishing:
+
+```
+t=32208  requested rows=64600 vblank=63376 (vblank_changed=1 settle=1)   <- 19s
+t=35239  requested rows=1700  vblank=476   (vblank_changed=1 settle=1)   <- 0.5s, 3s later
+         frame_start_after_ctrl=19103ms (first_fresh=81ms)
+         wait=19485 discarded=4 unpack=73 total=19559                    <- one completion, two workers
+```
+
+Which worker received the frame is undefined. This is a correctness hazard independent of the latency
+complaint, and it is the part worth fixing first.
+
+### 3. The sensor cannot shorten a frame already in progress
+
+With a 19s frame period programmed, writing a shorter exposure and blanking does not truncate the frame
+being integrated — the new period applies from the next frame boundary. So even a perfectly working
+software abort would still leave the 0.5s frame waiting for the 19s one to end. Only restarting the
+stream (`STREAMOFF` -> apply controls -> `STREAMON`) resets the timing.
+
+### Plan
+
+1. **Mutex the capture path** so only one worker can be inside `v4l2_capture_frame()`. Fixes the race by
+   itself.
+2. **Cancellable wait**: poll in short slices and check an atomic abort flag between them. Preferred over
+   issuing `STREAMOFF` from the aborting thread, which would race ioctls against a thread in `DQBUF`.
+3. **Stream restart on abort** to reset frame timing. This is the only part that makes the 0.5s exposure
+   arrive in ~0.5s. Measure the restart cost first — it should be well under the old ~515ms full teardown
+   because the buffers stay mapped.
+
+**Open decision:** restart on every shortening change, or only on an explicit abort? Restarting always
+makes any long->short transition responsive but charges the restart to ordinary exposure changes.
+Restarting only on abort leaves the normal path alone but depends on the client calling `AbortExposure`
+— SharpCap does when the slider moves, but that cannot be assumed generally.
+
+Until this is implemented, `CanAbortExposure`/`CanStopExposure` returning `true` misrepresents the driver
+and is a likely ASCOM Conformance finding.

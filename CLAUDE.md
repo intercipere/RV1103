@@ -800,6 +800,52 @@ Correctness checked by comparing a `settle=1` and a `settle=0` capture of the sa
 So the user's "almost 5s" was the unconditional discard, and the 7s that was really 6.25s was the row-time
 bug. Both fixed.
 
+## Exposure abort is advertised but not implemented — OPEN, with a real race underneath (2026-09-17)
+
+Reported scenario: in SharpCap, start a 19s exposure, then move the slider to 0.5s while it is running.
+The 0.5s exposure takes a very long time to arrive. Reproduced and measured over the API: the 0.5s frame
+arrived **16.6s** after it was requested (requested 11:32:06.6, ready 11:32:23.2).
+
+**Nothing here is fixed yet.** Three separate problems, in increasing order of how much they matter:
+
+1. **`AbortExposure`/`StopExposure` do nothing but flip state.** `camera_api.c` sets
+   `g_device.state = CAM_IDLE` and returns success; the comment there is honest that no mid-capture
+   cancellation exists. But `canabortexposure` and `canstopexposure` both report **true**, so clients
+   believe the abort worked. The worker thread stays blocked in `dqbuf_wait()` for up to a whole frame
+   period — 19s here.
+
+2. **Two exposure workers can run concurrently, racing on the V4L2 device.** `startexposure` only refuses
+   when `state == CAM_EXPOSING`, and the abort just cleared that, so a second `exposure_worker` thread is
+   spawned while the first is still inside `v4l2_capture_frame()`. Both then use the same fd and the same
+   mmap'd buffer pool. `g_ctrl_lock` in `v4l2_capture.c` guards only the control get/set path — **the
+   capture path has no mutex at all**. The log shows it plainly: two `requested rows=` lines 3s apart
+   (64600 rows then 1700 rows), and only **one** completion (`wait=19485 discarded=4`) for the two of
+   them. Which thread received which frame is undefined. This is a data race, not just latency.
+
+3. **Even a correct software abort would not fix the delay.** The sensor is mid-frame at a 19s frame
+   period; writing a shorter exposure and blanking does not shorten the frame already in progress,
+   because the period only takes effect at the next frame boundary. The 0.5s frame genuinely cannot start
+   until the 19s one finishes.
+
+Planned fix, not yet done:
+
+- **Serialise the capture path** with a mutex so only one worker can be inside `v4l2_capture_frame()`.
+  This fixes the race on its own and is worth doing regardless of the rest.
+- **Make abort real** by polling in short slices and checking an atomic abort flag between them, so the
+  worker unwinds promptly. Preferred over calling `STREAMOFF` from the aborting thread, which would race
+  ioctls against a thread sitting in `DQBUF`.
+- **Reset the sensor's frame timing on abort** — `STREAMOFF` -> apply controls -> `STREAMON`. This is the
+  only part that actually makes the 0.5s exposure arrive in ~0.5s. Measure the restart cost first; it
+  should be well under the old ~515ms full teardown since the buffers stay mapped.
+
+**Open design decision:** whether to restart the stream on every shortening change, or only on an explicit
+abort. Restarting always makes any long->short transition snappy but adds the restart cost to ordinary
+exposure changes; restarting only on abort leaves the normal path untouched but depends on the client
+actually calling `AbortExposure` (SharpCap does when the slider moves; not every client will).
+
+Until this is done, `canabortexposure`/`canstopexposure` reporting `true` is a conformance
+misrepresentation and is likely to show up in an ASCOM Conformance run.
+
 ## Where this stands (end of session, 2026-09-17)
 
 **Working tree is clean** apart from an untracked `PCB/` directory, which is not mine and was left alone.
@@ -823,24 +869,29 @@ Open next steps, roughly in order of value:
    arrive correctly and that the extra frame period per exposure is acceptable in a real guiding loop.
    Also still unconfirmed from the previous session: that PHD2's camera **Settings** button lands on the
    setup page and its dew-heater toggle.
-2. **Run the ASCOM Conformance tool.** Never done. It probes edge cases hand-testing does not, and the
-   driver now has two devices plus the setup URLs it expects.
-3. **Binning / subframing** — the largest remaining latency lever by a wide margin (2x2 would cut the
+2. **Implement exposure abort properly** (see the section above). Three parts: a mutex on the capture
+   path (fixes a real data race where two workers share the V4L2 fd), a genuine cancellable wait, and a
+   stream restart so a shortened exposure does not have to wait out the previous long frame. Measured
+   symptom: 16.6s to deliver a 0.5s exposure requested during a 19s one.
+3. **Run the ASCOM Conformance tool.** Never done. It probes edge cases hand-testing does not, and the
+   driver now has two devices plus the setup URLs it expects. Note it will likely flag
+   `CanAbortExposure`/`CanStopExposure`, which currently report `true` without working.
+4. **Binning / subframing** — the largest remaining latency lever by a wide margin (2x2 would cut the
    265ms `mg_write` to ~66ms). Blocked on a design decision, not on effort: SC3336 is Bayer so binning a
    quad mixes colour channels; the production IMX290 is mono, where it is trivial. `ReadoutModes` is the
    right ASCOM mechanism to expose it (see `alpaca/README.md`).
-4. **Re-run the boot-time measurement** to check the `quiet` bootarg's real effect — build-verified only,
+5. **Re-run the boot-time measurement** to check the `quiet` bootarg's real effect — build-verified only,
    never timed on hardware. The `dhcpcd`/boot-to-discoverable half of this is now **done**: measured,
    the `timeout 1` override disproved and removed, and ~9.6s cut by assigning usb0's address directly
    (see above). What remains unmeasured is `quiet`, and the *host*-side IPv4LL delay, which is additive
    and outside our control.
-5. **Unpin gain.** Gain is still pinned at 128 (1x) and client gain PUTs are accepted but ignored; the
+6. **Unpin gain.** Gain is still pinned at 128 (1x) and client gain PUTs are accepted but ignored; the
    Int16-safe 0..1000 scale and its 32x practical ceiling are already implemented behind it.
-6. Optional: disable ISP/RGA/MPP/NPU/audio in **kernel Kconfig** too (they still compile, just are never
+7. Optional: disable ISP/RGA/MPP/NPU/audio in **kernel Kconfig** too (they still compile, just are never
    loaded) for a further flash-size cut.
-7. A custom **SPI NAND board config** for the 64-128MB deployment target — not started, independent of
+8. A custom **SPI NAND board config** for the 64-128MB deployment target — not started, independent of
    the SD_CARD debloat. This is also where Rockchip's thunderboot fast-boot feature becomes applicable.
-8. Longer term, **retarget the whole stack to RV1106G3** (256MB RAM) once validated on RV1103.
+9. Longer term, **retarget the whole stack to RV1106G3** (256MB RAM) once validated on RV1103.
 
 Closed since this list was last rewritten, so nobody re-opens them: the SC3336 exposure ceiling question
 (answered — 0.899s stock, **1.799s** after raising `SC3336_VTS_MAX` to the register maximum, and
