@@ -219,8 +219,13 @@ static int qbuf_index(unsigned index) {
 }
 
 /* Dequeues one buffer if one is already done, without blocking. Returns its
- * index, -1 if none is ready (EAGAIN) or on error. */
-static int dqbuf_nowait(void) {
+ * index, -1 if none is ready (EAGAIN) or on error. When ts_ns is non-NULL it
+ * receives the buffer's timestamp, which rkcif sets from the CSI frame-START
+ * interrupt (capture.c: vb2_buf.timestamp = readout.fs_timestamp). Note that
+ * this is when READOUT started, not when integration started -- on a rolling
+ * shutter those differ by about a frame period, which is why the caller needs
+ * one more discard beyond the timestamp test. */
+static int dqbuf_nowait(uint64_t *ts_ns) {
 	struct v4l2_plane plane;
 	struct v4l2_buffer buf;
 	memset(&plane, 0, sizeof(plane));
@@ -231,6 +236,9 @@ static int dqbuf_nowait(void) {
 	buf.length = 1;
 	if (ioctl(g_fd, VIDIOC_DQBUF, &buf) < 0)
 		return -1;
+	if (ts_ns != NULL)
+		*ts_ns = (uint64_t)buf.timestamp.tv_sec * 1000000000ull +
+		         (uint64_t)buf.timestamp.tv_usec * 1000ull;
 	return (int)buf.index;
 }
 
@@ -238,7 +246,7 @@ static int dqbuf_nowait(void) {
  * O_NONBLOCK so that dqbuf_nowait() above works; poll() supplies the blocking
  * half, and unlike a blocking DQBUF it can actually time out rather than
  * wedging the exposure thread forever if the CSI link drops. */
-static int dqbuf_wait(int timeout_ms) {
+static int dqbuf_wait(int timeout_ms, uint64_t *ts_ns) {
 	struct pollfd pfd = {.fd = g_fd, .events = POLLIN, .revents = 0};
 	for (;;) {
 		int r = poll(&pfd, 1, timeout_ms);
@@ -246,7 +254,7 @@ static int dqbuf_wait(int timeout_ms) {
 			continue;
 		if (r <= 0)
 			return -1;
-		int idx = dqbuf_nowait();
+		int idx = dqbuf_nowait(ts_ns);
 		if (idx >= 0)
 			return idx;
 		if (errno != EAGAIN)
@@ -329,7 +337,7 @@ int v4l2_capture_init(const sensor_desc_t *desc) {
 	 * (confirmed on real hardware) -- absorb that here, before the HTTP
 	 * server starts, so no client ever sees it. */
 	v4l2_frame_t warmup;
-	if (v4l2_capture_frame(&warmup) != 0) {
+	if (v4l2_capture_frame(&warmup, 0.0, 0) != 0) {
 		teardown_locked();
 		return -1;
 	}
@@ -341,49 +349,112 @@ void v4l2_capture_shutdown(void) {
 	teardown_locked();
 }
 
-/* Generous relative to any frame period this driver produces (37ms at
- * vertical_blanking=64); it exists to fail an exposure rather than hang the
- * daemon if the CSI link stops delivering, not to bound normal waits. */
-#define DQBUF_TIMEOUT_MS 5000
+/* The DQBUF timeout exists to fail an exposure rather than hang the daemon if
+ * the CSI link stops delivering -- it must never be the thing that bounds a
+ * legitimate exposure. It used to be a flat 5000ms, which was fine only
+ * because vertical_blanking was pinned; with client-driven blanking a frame
+ * period can exceed it, and the exposure then fails for no sensor reason.
+ *
+ * Each dqbuf_wait() below blocks for at most one frame period, so scale from
+ * that, with a wide multiplier (the first frame after a blanking change can
+ * straddle an old, longer period) and a floor that preserves the previous
+ * behaviour for short exposures. */
+#define DQBUF_TIMEOUT_FLOOR_MS 5000
 
-int v4l2_capture_frame(v4l2_frame_t *out) {
+static int dqbuf_timeout_ms(double frame_period_s) {
+	if (!(frame_period_s > 0.0))
+		return DQBUF_TIMEOUT_FLOOR_MS;
+	double ms = frame_period_s * 1000.0 * 3.0 + DQBUF_TIMEOUT_FLOOR_MS;
+	if (ms > 120000.0)
+		ms = 120000.0; /* absolute backstop, still > any sane exposure */
+	return (int)ms;
+}
+
+uint64_t v4l2_capture_now_ns(void) {
+	/* Must match the clock rkcif stamps buffers with. On RV1106 that is
+	 * rkcif_time_get_ns() -> ktime_get_boottime_ns() (cif/dev.h), even though
+	 * the queue advertises V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC. The two differ
+	 * only by time spent suspended, which this board never does, but matching
+	 * the driver exactly costs nothing and removes the assumption. */
+	struct timespec ts;
+	if (clock_gettime(CLOCK_BOOTTIME, &ts) != 0)
+		return 0;
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* Bounds the freshness loop below. Each iteration consumes one real frame, so
+ * this only trips if the driver keeps handing back frames that started before
+ * the controls were written -- a stuck pipeline, not a slow one. The dqbuf
+ * timeout is what bounds waiting for a *slow* frame. */
+#define MAX_STALE_DISCARDS 8
+
+int v4l2_capture_frame(v4l2_frame_t *out, double frame_period_s,
+                       uint64_t settle_ref_ns) {
+	const int timeout_ms = dqbuf_timeout_ms(frame_period_s);
 	if (g_fd < 0)
 		return -1;
 
 	double t0 = now_ms();
 
 	/* Streaming never stops between exposures, so the pool holds frames that
-	 * were captured before the caller's v4l2_ctrl_set() calls. Drain every
-	 * already-completed buffer (non-blocking) and requeue it, then discard one
-	 * more blocking frame: that one may have *started* while we were draining,
-	 * i.e. still before the new controls latched. What comes after it is the
-	 * first frame that both started and finished under the new settings.
+	 * began before the caller's v4l2_ctrl_set() calls and therefore carry the
+	 * *previous* exposure's settings. Discard until we get one that started
+	 * after settle_ref_ns (the moment those writes completed).
 	 *
-	 * One discard is enough even when the frame period itself just changed.
-	 * An earlier `extra_settle` flag discarded a second frame on any blanking
-	 * change; it was needed under the old single-buffer scheme, but measured
-	 * unnecessary here (2026-09-16) -- see alpaca/README.md. Dropping it saved
-	 * 25-37% of the loop time on long exposures. */
+	 * This used to be "drain what's ready, then discard exactly one more",
+	 * which is not sound: with a 3-buffer pool up to two frames can still be
+	 * in flight, so whether the survivor was fresh depended on timing. It
+	 * failed for real -- 3 of 8 alternating 0.05s/0.5s exposures came back
+	 * with the previous frame (measured 2026-09-17: dqbuf ~46ms for a 0.5s
+	 * exposure, which is physically impossible).
+	 *
+	 * An earlier `extra_settle` flag papered over this by discarding a second
+	 * frame on any blanking change. It was removed on 2026-09-16 as "measured
+	 * obsolete", but that A/B used OAG_FRAME_STATS as ground truth and the
+	 * stats walk adds ~85ms per capture, which masked the race: with stats on
+	 * the failure does not reproduce at all, with stats off it is ~40%.
+	 * Comparing frame timestamps makes that first part deterministic: however
+	 * many frames the pool happens to be holding, they are identified by when
+	 * they started rather than by counting.
+	 *
+	 * That alone is NOT sufficient, and measuring is what showed it. The
+	 * timestamp rkcif reports is the frame-START (readout) interrupt, but this
+	 * is a ROLLING SHUTTER: integration for a frame begins roughly one frame
+	 * period before its readout starts. So the first frame with
+	 * fs_timestamp >= settle_ref_ns was already integrating when the controls
+	 * were written, and still carries the old exposure -- observed directly
+	 * (2026-09-17): discarding purely by timestamp still returned a 151ms
+	 * frame for a 0.5s request. Hence exactly one more discard after the
+	 * timestamp filter passes. That one is principled rather than tuned: it is
+	 * the frame whose integration straddles the write. */
+	int discarded = 0;
+	int idx;
+	uint64_t ts_ns = 0;
 	for (;;) {
-		int idx = dqbuf_nowait();
+		idx = dqbuf_wait(timeout_ms, &ts_ns);
 		if (idx < 0)
-			break;
+			return -1;
+		if (settle_ref_ns == 0 || ts_ns == 0 || ts_ns >= settle_ref_ns)
+			break; /* started after the controls landed (or unknowable) */
 		if (qbuf_index((unsigned)idx) < 0)
 			return -1;
+		if (++discarded >= MAX_STALE_DISCARDS) {
+			fprintf(stderr,
+			        "[v4l2] gave up after %d stale frames (ref=%llu)\n",
+			        discarded, (unsigned long long)settle_ref_ns);
+			return -1;
+		}
 	}
-	{
-		int idx = dqbuf_wait(DQBUF_TIMEOUT_MS);
-		if (idx < 0)
-			return -1;
+	if (settle_ref_ns != 0) {
 		if (qbuf_index((unsigned)idx) < 0)
+			return -1;
+		discarded++;
+		idx = dqbuf_wait(timeout_ms, &ts_ns);
+		if (idx < 0)
 			return -1;
 	}
 	double t_discard = now_ms();
-
-	int idx = dqbuf_wait(DQBUF_TIMEOUT_MS);
-	if (idx < 0)
-		return -1;
-	double t_dqbuf = now_ms();
+	double t_dqbuf = t_discard;
 
 	out->width = g_desc->width;
 	out->height = g_desc->height;
@@ -406,9 +477,9 @@ int v4l2_capture_frame(v4l2_frame_t *out) {
 	double t_requeue = now_ms();
 
 	fprintf(stderr,
-	        "[v4l2] discard=%.0f dqbuf=%.0f unpack=%.0f requeue=%.0f "
+	        "[v4l2] wait=%.0f discarded=%d unpack=%.0f requeue=%.0f "
 	        "total=%.0f\n",
-	        t_discard - t0, t_dqbuf - t_discard, t_unpack - t_dqbuf,
+	        t_discard - t0, discarded, t_unpack - t_dqbuf,
 	        t_requeue - t_unpack, t_requeue - t0);
 	return 0;
 }

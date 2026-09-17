@@ -21,7 +21,7 @@ int main(int argc, char **argv) {
 	}
 
 	v4l2_frame_t frame;
-	if (v4l2_capture_frame(&frame) != 0) {
+	if (v4l2_capture_frame(&frame, 0.0, 0) != 0) {
 		fprintf(stderr, "capture failed\n");
 		v4l2_capture_shutdown();
 		return 1;

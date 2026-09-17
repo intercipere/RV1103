@@ -500,13 +500,17 @@ matches, including partial-band/partial-tile dimensions). Two related changes in
   loop ~0.49s. **`ExposureMax` = 0.899s** — that is the SC3336's real driver-enforced ceiling, answering
   the long-open "push the SC3336 exposure ceiling" question: ~0.9s. Long exposures apply exactly
   (`rows=18214 -> vblank=16990`).
-- **`extra_settle` removed — measured obsolete (2026-09-16).** It discarded a second frame on any blanking
+- **[SUPERSEDED — the conclusion below was wrong; see "Stale frames" in the 2026-09-17 section]**
+  **`extra_settle` removed — measured obsolete (2026-09-16).** It discarded a second frame on any blanking
   change, added for a stale-frame bug under the **old single-buffer** scheme; the 3-buffer pool + non-
   blocking drain makes one discard sufficient. Verified by making it runtime-switchable
   (`OAG_EXTRA_SETTLE=0/1`) and A/B-ing the *same binary* over 14 exposures alternating 0.005/0.3/0.5/0.8s
   in both directions, **starting with a long exposure right after daemon start** (the exact original
   failure case), using the device's own `OAG_FRAME_STATS` means as ground truth. Correctness identical;
   loop time **-25% at 0.3s, -31% at 0.5s, -36% at 0.8s**. Flag and parameter fully removed.
+  **Why this was wrong:** the A/B used `OAG_FRAME_STATS` as ground truth, and that stats walk costs ~85ms
+  per capture — enough to hide the race. With stats **on** the failure does not reproduce at all; with
+  stats **off** it reproduces ~40% of the time. The instrument changed the thing it was measuring.
 - **USB gadget MAC pinned (2026-09-16, hardware-verified).** `S50usbdevice` never set RNDIS
   `host_addr`/`dev_addr`, so `f_rndis` randomized them every boot; `host_addr` is what names the host's
   interface (`enx<host_addr>`), so Linux got a new NM profile stuck in DHCP on every replug and Windows a
@@ -615,25 +619,85 @@ Working style for this project: prefer empirical validation over guessing (measu
 dark frames as ground truth); push back on unverified fixes offered as definitive — get the actual
 measurement or check.
 
-## Where this stands (end of session, 2026-09-16)
+## Long exposures and the stale-frame bug (2026-09-17)
 
-**Working tree is clean.** Everything through the setup page (`alpaca/src/setup_api.{c,h}`, the
-`switch_api` accessors it needs, its registration in `main.c`, the refreshed overlay binary, and this
-documentation pass) is committed as the tip of `main`: "Serve a setup page so the dew heater is reachable
-from PHD2". All of it is hardware-verified.
+Prompted by planning the custom PCB (IMX327), the SC3336 was pushed past its 0.899s ceiling to exercise
+the long-exposure path before IMX hardware exists. Two ceilings, both software:
+
+- **`SC3336_VTS_MAX` raised 0x7fff -> 0xffff (shipped).** The vendor value was exactly half the range of
+  the 16-bit VTS register pair (0x320e/0x320f) that `sc3336_set_ctrl()` already writes unmasked — a
+  software cap, not a hardware one. Bit 7 of 0x320e **is** implemented: `ExposureMax` 0.899s -> **1.799s**,
+  `vertical_blanking` max 31471 -> 64239, verified with real 1.79s exposures returning correct data.
+- **HTS (row time) is the bigger lever, but was only used as a throwaway diagnostic (not shipped).**
+  Row time is HTS/pixel_rate, and the driver never writes HTS at all — the sensor runs its power-on
+  default. A temporary module param scaling it reached **`ExposureMax` = 10.79s** at 6x, with real
+  6.0s and 10.5s exposures verified. Reverted after testing; `git log` has it if ever needed again.
+  **Note for anyone redoing this:** the HTS register read back as **1250 (0x04e2)**, NOT `hts_def`/2
+  (`hts_def` is 2800, so the ratio is 2.24, not 2). Do not assume `hts_def`'s units — read
+  0x320c/0x320d back and scale *that*, which is what made the experiment correct despite the wrong guess.
+
+**`DQBUF_TIMEOUT_MS 5000` was a real ceiling, now measured rather than argued.** At 6.0s the DQBUF wait
+was 5367ms and at 10.5s it was 9384ms — both past the old flat timeout, so those exposures would have
+failed in the capture layer regardless of sensor support. `v4l2_capture_frame()` now takes
+`frame_period_s` and derives the timeout from it (3x period + 5s floor, 120s backstop), computed in
+`exposure_worker()` from the *applied* vblank.
+
+**Stale frames: a real correctness bug, found and fixed.** Alternating 0.05s/0.5s exposures, **3 of 8**
+returned the *previous* exposure's frame — DQBUF waits of 46/51/47ms for a 0.5s exposure, physically
+impossible. The old "drain what's ready, then discard exactly one more" is not sound: with a 3-buffer
+pool the number of in-flight stale frames varies, so freshness depended on timing. This is what
+`extra_settle` used to mask, and why its removal (2026-09-16) looked safe — see the SUPERSEDED note above.
+
+Fixed in two parts, both necessary and both measured:
+1. **Discard by frame timestamp, not by count.** rkcif stamps each buffer from the CSI frame-START
+   interrupt (`capture.c`: `vb2_buf.timestamp = readout.fs_timestamp`), so frames that began before the
+   control writes are identified directly. `exposure_worker()` samples the reference right after the
+   writes via `v4l2_capture_now_ns()`. **That helper uses `CLOCK_BOOTTIME`, deliberately:** on RV1106
+   `rkcif_time_get_ns()` is `ktime_get_boottime_ns()` (`cif/dev.h`) even though the queue advertises
+   `V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC`. They differ only across suspend, which this board never does,
+   but matching the driver removes the assumption.
+2. **Then exactly one more discard, because this is a rolling shutter.** The timestamp is readout start;
+   integration begins ~one frame period earlier, so the first frame with `fs_timestamp >= ref` was
+   already integrating when the controls were written. Timestamp filtering *alone* still returned a
+   151ms frame for a 0.5s request — measured, not assumed. The extra discard is principled (it is the
+   frame straddling the write), not tuned.
+
+Result: 10/10 identical at `wait=506-514ms` for a 0.5s request (was: correct-or-151ms at random), means
+rising monotonically with exposure (0.01s ~145, 0.2s ~560, 1.0s 908, 1.79s 972), `ImageBytes` byte-exact
+at 5972012 with `ImageElementType=2`/`TransmissionElementType=8`. Cost is one extra frame period per
+exposure versus the *fast-but-wrong* path; versus the previously-correct path it is roughly unchanged.
+
+**Method note worth keeping:** `OAG_FRAME_STATS` is not a neutral observer. Its ~85ms walk changes
+capture timing enough to hide this class of race entirely (8/8 clean with it on, 3/8 stale with it off).
+Frame *means* are also a weak detector — a saturated daylight scene reads 1023 at every exposure. DQBUF
+wall-clock time is the reliable signal for staleness.
+
+**This bug is not sensor-specific and will follow us to IMX327.** It lives in the rkcif buffer pool plus
+our capture logic, not in `sc3336.c`; any sensor whose control writes take effect a frame later has it,
+and `imx327.c` has exactly the same shape (SHS1/VMAX over I2C, effective next frame). It matters *more*
+there: a stale frame costs one whole exposure, so at the multi-second exposures the IMX327 is being
+chosen for, a 40% stale rate would be crippling. The fix is in the sensor-agnostic V4L2 layer, so it
+carries over unchanged.
+
+## Where this stands (end of session, 2026-09-17)
+
+**Working tree is clean.** The long-exposure work (raised `SC3336_VTS_MAX`, the scaled DQBUF timeout, the
+timestamp+rolling-shutter stale-frame fix, the refreshed overlay binary, and this documentation pass) is
+committed as the tip of `main`. All of it is hardware-verified.
 
 The board and the `overlay-luckfox-astroguider` copy of `alpacad` are both running the exact binary
 these sources build (md5 confirmed identical on both sides), so a reflash reproduces what was tested.
 Note the live SD card may still be newer than the last full `./build.sh ... firmware` output — run a
-fresh full build before trusting `output/image/sd_update.img`.
+fresh full build before trusting `output/image/sd_update.img`. The board also needs a fresh
+`./build.sh kernel` for the `sc3336.ko` change to reach an image (it was hot-pushed for testing).
 
 Open next steps, roughly in order of value:
 
-1. **Retest against a live PHD2 / N.I.N.A. / SharpCap session.** All three worked as of the previous
-   session; this session's changes are additive (a new HTML page on previously-404 URLs) and were
-   verified over the real RNDIS link with API routing confirmed unaffected, but no ASCOM client has run
-   since. The specific thing to confirm is that PHD2's camera **Settings** button now lands on the setup
-   page and its dew-heater toggle.
+1. **Retest against a live PHD2 / N.I.N.A. / SharpCap session.** The stale-frame fix changes the capture
+   path for *every* exposure, and no ASCOM client has run since. Worth confirming both that images still
+   arrive correctly and that the extra frame period per exposure is acceptable in a real guiding loop.
+   Also still unconfirmed from the previous session: that PHD2's camera **Settings** button lands on the
+   setup page and its dew-heater toggle.
 2. **Run the ASCOM Conformance tool.** Never done. It probes edge cases hand-testing does not, and the
    driver now has two devices plus the setup URLs it expects.
 3. **Binning / subframing** — the largest remaining latency lever by a wide margin (2x2 would cut the
@@ -652,6 +716,15 @@ Open next steps, roughly in order of value:
 8. Longer term, **retarget the whole stack to RV1106G3** (256MB RAM) once validated on RV1103.
 
 Closed since this list was last rewritten, so nobody re-opens them: the SC3336 exposure ceiling question
-(answered — ~0.899s, and `ExposureMax` tracks it live); the `send_imagebytes()` transpose cost (fixed,
-then fused into the unpack); the real-link `mg_write` measurement (265ms, ~22.5MB/s); and the SharpCap
-black-image bug (the `ImageElementType` fix).
+(answered twice — the driver-enforced 0.899s, then **1.799s** after raising `SC3336_VTS_MAX`, and up to
+10.79s with the throwaway HTS diagnostic); the hardcoded `DQBUF_TIMEOUT_MS` ceiling (now derived from the
+frame period, and the old 5s limit proven real by measurement); the stale-frame race (fixed by frame
+timestamps plus one rolling-shutter discard); the `send_imagebytes()` transpose cost (fixed, then fused
+into the unpack); the real-link `mg_write` measurement (265ms, ~22.5MB/s); and the SharpCap black-image
+bug (the `ImageElementType` fix).
+
+For the PCB planning that started this session — IMX327 vs IMX290 driver status, slave-mode findings from
+the datasheets, and the Luckfox-stripping question — see `alpaca/README.md` and the discussion notes; the
+short version is that `imx327.c` is a full Rockchip vendor driver (not a stub) with the same control model
+as `sc3336.c`, and slave mode genuinely bypasses VMAX (frame period comes from external XVS), so exposure
+length there has no register-width ceiling.

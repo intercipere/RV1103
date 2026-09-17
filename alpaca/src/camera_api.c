@@ -208,6 +208,10 @@ static void *exposure_worker(void *arg) {
 		v4l2_ctrl_set(s->subdev_path, s->ctrl_exposure, job->rows);
 	}
 
+	/* Sampled after the control writes have completed: any frame that started
+	 * before this instant was integrating under the previous settings. */
+	uint64_t settle_ref_ns = v4l2_capture_now_ns();
+
 	double t_ctrl_start = now_ms();
 	int64_t applied_exposure = -1, applied_vblank = -1;
 	v4l2_ctrl_get(s->subdev_path, s->ctrl_exposure, &applied_exposure);
@@ -218,9 +222,18 @@ static void *exposure_worker(void *arg) {
 	        now_ms(), job->rows, (long long)applied_exposure,
 	        (long long)applied_vblank, vblank_changed);
 
+	/* Derive the DQBUF timeout from the frame period actually programmed, so
+	 * a long exposure is never cut short by the capture layer's own timeout.
+	 * applied_vblank is -1 only if the readback failed; 0.0 then selects the
+	 * floor rather than a nonsense negative period. */
+	double frame_period_s =
+	    applied_vblank >= 0
+	        ? (double)(s->height + applied_vblank) * s->row_time_us / 1e6
+	        : 0.0;
+
 	double t_capture_start = now_ms();
 	v4l2_frame_t frame;
-	int ok = (v4l2_capture_frame(&frame) == 0);
+	int ok = (v4l2_capture_frame(&frame, frame_period_s, settle_ref_ns) == 0);
 	double t_capture_end = now_ms();
 	fprintf(stderr,
 	        "[t=%.0f] [exposure] v4l2_capture_frame took %.0fms (ctrl setup "

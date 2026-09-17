@@ -58,7 +58,14 @@
 #define SC3336_REG_EXPOSURE_L		0x3e02
 #define	SC3336_EXPOSURE_MIN		1
 #define	SC3336_EXPOSURE_STEP		1
-#define SC3336_VTS_MAX			0x7fff
+/* The vendor driver shipped 0x7fff here, which is exactly half the range of
+ * the 16-bit VTS register pair (0x320e/0x320f) that sc3336_set_ctrl() already
+ * writes unmasked -- a software cap, not a hardware one. Verified on real
+ * hardware (2026-09-17): at 0xffff the sensor genuinely integrates for the
+ * full frame, doubling the exposure ceiling from 0.899s to 1.799s
+ * (vertical_blanking max 31471 -> 64239) with correct image data. Longer
+ * exposures are the whole point of this build. */
+#define SC3336_VTS_MAX			0xffff
 
 #define SC3336_REG_DIG_GAIN		0x3e06
 #define SC3336_REG_DIG_FINE_GAIN	0x3e07

@@ -936,7 +936,14 @@ So a long exposure costs roughly **two** full frame periods (one discarded, one 
 
 The obvious candidate was `extra_settle`. **Experiment run, and it is obsolete — now removed.** See below.
 
-## extra_settle removed after an A/B experiment (2026-09-16)
+## extra_settle removed after an A/B experiment (2026-09-16) — SUPERSEDED, the conclusion was wrong
+
+> **Superseded 2026-09-17.** The experiment below used `OAG_FRAME_STATS` as ground truth, and that stats
+> walk costs ~85ms per capture — enough to hide the very race `extra_settle` was guarding against. With
+> stats on the failure does not reproduce at all; with stats off it reproduces ~40% of the time. The
+> removal was real, but the reasoning was invalid; see "Stale frames" at the end of this file for the
+> replacement, which does not rely on counting discards at all. Kept here for method.
+
 
 `extra_settle` discarded a second frame whenever `vertical_blanking` changed. It was added for a
 stale-frame bug seen **under the old single-buffer capture scheme**; the 3-buffer pool plus non-blocking
@@ -1156,3 +1163,87 @@ civetweb's `<handler>/anything` step is what makes it cover the per-device URLs 
 The exposure minimum is one sensor row (~27 µs), which a fixed millisecond format rendered as a
 meaningless `0.0 ms` — caught by looking at the rendered page, not the code. The formatter now switches
 between µs, ms and s.
+
+
+## Stale frames: fixed by frame timestamps plus one rolling-shutter discard (2026-09-17)
+
+### The bug
+
+Alternating 0.05s and 0.5s exposures, **3 of 8** of the 0.5s requests came back with the *previous*
+exposure's frame. The signal is the DQBUF wait time: 46 / 51 / 47 ms for a 0.5s exposure, which no
+0.5s integration can produce. The stale cases correlate with a very small discard time (17-24ms vs
+39-78ms when correct).
+
+Root cause: "drain whatever is ready (non-blocking), then discard exactly one more" does not bound how
+many stale frames the pool holds. With `REQBUFS count = 3`, up to two frames can still be in flight when
+the control writes land, so whether the survivor was fresh came down to timing.
+
+Two things made this hard to see earlier:
+
+- **`OAG_FRAME_STATS` masks it.** Its ~85ms per-frame walk perturbs capture timing enough that the race
+  stops reproducing (8/8 clean with it on, 3/8 stale with it off). The 2026-09-16 A/B that removed
+  `extra_settle` used exactly that flag as its ground truth.
+- **Frame means are a weak detector.** A saturated daylight scene reads `max=1023` and a similar mean at
+  both exposures, so "means identical across repeats" does not prove freshness. Wall-clock DQBUF time
+  does.
+
+### The fix, in two parts
+
+**1. Discard by timestamp rather than by count.** rkcif stamps every buffer from the CSI frame-START
+interrupt (`capture.c`: `vb2_buf.timestamp = readout.fs_timestamp`), so a frame that began before the
+control writes can be identified directly instead of guessed at. `exposure_worker()` samples the
+reference with `v4l2_capture_now_ns()` immediately after the writes complete, and `v4l2_capture_frame()`
+discards any buffer whose timestamp predates it (bounded by `MAX_STALE_DISCARDS`, which only trips on a
+stuck pipeline — a *slow* pipeline is bounded by the DQBUF timeout instead).
+
+`v4l2_capture_now_ns()` uses **`CLOCK_BOOTTIME`**, not `CLOCK_MONOTONIC`, on purpose: on RV1106
+`rkcif_time_get_ns()` resolves to `ktime_get_boottime_ns()` (`cif/dev.h:1049`) even though the queue
+advertises `V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC`. The two differ only by time spent suspended, which this
+board never does, but matching the driver exactly costs nothing and removes an assumption.
+
+**2. Then exactly one more discard, because this is a rolling shutter.** The timestamp marks readout
+start, but integration for that frame began roughly one frame period earlier — so the first frame with
+`fs_timestamp >= ref` was *already integrating* when the controls were written, and still carries the old
+exposure. This is not theory: timestamp filtering alone still returned a **151ms** frame for a 0.5s
+request (`wait=74 discarded=3`). The extra discard is principled rather than tuned — it is precisely the
+frame whose integration straddles the write — which is why it does not need a flag or a condition.
+
+### Verification (hardware, 2026-09-17)
+
+- 0.5s after 0.05s, 10 consecutive runs: `wait=506-514ms`, `discarded=4` every time. No variance, no
+  fast-and-wrong outcomes. (Before: correct-or-151ms at random.)
+- Means rise monotonically with exposure — 0.01s ~145, 0.2s ~560, 1.0s 908, 1.79s 972 — and repeat
+  consistently at each level.
+- `ImageBytes` byte-exact at 5972012 = 44 + 2304x1296x2, header `ImageElementType=2`,
+  `TransmissionElementType=8`, `Rank=2`, dims 2304 x 1296.
+
+Cost is one extra frame period per exposure relative to the *fast-but-wrong* path; relative to the
+previously-correct path it is roughly unchanged (~590ms loop at 0.5s).
+
+### This will follow us to the IMX sensors
+
+The bug is in the rkcif buffer pool plus this daemon's capture logic, not in `sc3336.c`. Any sensor whose
+control writes take effect a frame later has it, and `imx327.c` has the same shape (SHS1/VMAX written
+over I2C, effective from the next frame). It matters *more* there, because a stale frame costs one whole
+exposure — at the multi-second exposures the IMX327 is being chosen for, a 40% stale rate would be
+crippling. The fix lives in the sensor-agnostic V4L2 layer, so it carries over unchanged.
+
+## Long exposures: two software ceilings (2026-09-17)
+
+**`SC3336_VTS_MAX` 0x7fff -> 0xffff (shipped).** The vendor cap sat at exactly half the range of the
+16-bit VTS register pair (0x320e/0x320f), which `sc3336_set_ctrl()` already writes unmasked. Bit 7 of
+0x320e is implemented: `ExposureMax` 0.899s -> **1.799s**, `vertical_blanking` max 31471 -> 64239,
+verified with real 1.79s exposures returning correct, correctly-scaled data.
+
+**HTS is the bigger lever (diagnostic only, reverted).** Row time is HTS/pixel_rate and the driver never
+writes HTS, so the sensor runs its power-on default. A temporary module parameter scaling it reached
+`ExposureMax` = **10.79s** at 6x, with real 6.0s and 10.5s exposures verified. If this is ever redone:
+the HTS register read back as **1250 (0x04e2)**, *not* `hts_def`/2 — `hts_def` is 2800, a ratio of 2.24,
+so its units do not match the register. Read 0x320c/0x320d back and scale that value; do not derive it
+from `hts_def`.
+
+**The DQBUF timeout was a real ceiling.** At 6.0s the DQBUF wait measured 5367ms and at 10.5s it measured
+9384ms, both past the old flat `DQBUF_TIMEOUT_MS 5000` — so those exposures would have failed in the
+capture layer no matter what the sensor supported. `v4l2_capture_frame()` now takes `frame_period_s` and
+derives the timeout from it (3x period + 5s floor, 120s backstop), computed in `exposure_worker()` from
+the *applied* vblank so it tracks whatever is actually programmed.

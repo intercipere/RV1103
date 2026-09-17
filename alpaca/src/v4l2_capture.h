@@ -49,7 +49,27 @@ void v4l2_capture_shutdown(void);
  * those calls (necessary because streaming never stops between exposures --
  * see the .c file). Returns 0 on success, -1 on error (including if
  * v4l2_capture_init() wasn't called or failed).
+ *
+ * frame_period_s is the caller's estimate of the sensor's *current* frame
+ * period (height + vertical_blanking, in seconds). Each internal DQBUF wait
+ * blocks for up to one frame period, so this is what the DQBUF timeout is
+ * derived from; a hardcoded timeout silently caps the longest exposure the
+ * daemon can return regardless of what the sensor supports. Pass 0.0 when
+ * the period is unknown or short -- the timeout has a floor.
+ *
+ * settle_ref_ns is v4l2_capture_now_ns() sampled immediately *after* the
+ * caller's control writes completed. Frames that started before it carry the
+ * previous exposure's settings and are discarded. Pass 0 to disable the check
+ * and take the next frame (startup warm-up, standalone test tools).
  */
-int v4l2_capture_frame(v4l2_frame_t *out);
+int v4l2_capture_frame(v4l2_frame_t *out, double frame_period_s,
+                       uint64_t settle_ref_ns);
+
+/*
+ * Current time on the same clock rkcif stamps buffers with, for settle_ref_ns.
+ * Callers must use this rather than their own clock_gettime(), because the two
+ * have to be comparable.
+ */
+uint64_t v4l2_capture_now_ns(void);
 
 #endif
