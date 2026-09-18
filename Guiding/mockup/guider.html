@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'>
+<title>OpenAstroGuider</title>
+<!--
+  OpenAstroGuider -- guider control page (MOCKUP).
+
+  Self-contained by necessity, exactly like setup_api.c's page: the only link
+  to this device is a link-local USB or AP network with no route to the
+  internet, so an external stylesheet, script or font would simply hang.
+
+  Single-theme on purpose. This page is opened at the telescope in the dark;
+  a light mode would cost the user their dark adaptation for minutes, so the
+  palette stays warm/red throughout and the RA and Dec traces are separated by
+  hue AND brightness rather than the usual blue-vs-red.
+
+  All data here is simulated in the script at the bottom. To make this real,
+  replace the simulation with a poll of the guider state and keep the drawing
+  code as-is.
+-->
+<style>
+:root{
+  --bg:#131110; --card:#1e1b19; --card2:#191615; --line:#37312d;
+  --fg:#ece7e3; --dim:#9c938d; --faint:#6d645f;
+  --accent:#e0523a; --ra:#e8623f; --dec:#c08a3c;
+  --ok:#6f9e6a; --warn:#c9973f; --crit:#d1493f;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+}
+*{box-sizing:border-box}
+html,body{background:var(--bg)}
+body{
+  margin:0; color:var(--fg); background:var(--bg);
+  font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  -webkit-text-size-adjust:100%;
+}
+main{max-width:560px;margin:0 auto;padding-block:22px 40px;padding-left:16px;padding-right:16px}
+
+header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
+h1{font-size:19px;margin:0;letter-spacing:.01em;font-weight:600}
+.addr{font:12px/1.4 var(--mono);color:var(--faint)}
+.demo{
+  display:inline-block;margin:10px 0 20px;padding:5px 9px;border-radius:5px;
+  border:1px dashed var(--line);color:var(--dim);font-size:12px;letter-spacing:.02em;
+}
+
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:14px}
+h2{font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--dim);font-weight:600;margin:0 0 14px;
+   display:flex;justify-content:space-between;align-items:center;gap:10px}
+h2 .meta{text-transform:none;letter-spacing:0;font-weight:400;font-family:var(--mono);font-size:11px;color:var(--faint)}
+
+/* ---- state strip ---------------------------------------------------- */
+.state{display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;
+      font-size:13px;font-weight:600;border:1px solid transparent}
+.pill.guiding{background:rgba(111,158,106,.14);border-color:rgba(111,158,106,.4);color:var(--ok)}
+.pill.lost{background:rgba(209,73,63,.14);border-color:rgba(209,73,63,.45);color:var(--crit)}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
+.pill.guiding .dot{animation:pulse 2.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@media (prefers-reduced-motion:reduce){.pill.guiding .dot{animation:none}}
+.since{font:12px/1 var(--mono);color:var(--faint)}
+
+/* ---- stat tiles ----------------------------------------------------- */
+.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);
+       border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.tile{background:var(--card2);padding:11px 12px}
+.tile .k{font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:var(--faint)}
+.tile .v{font:600 19px/1.25 var(--mono);font-variant-numeric:tabular-nums;margin-top:3px}
+.tile .u{font-size:11px;color:var(--dim);font-weight:400}
+
+/* ---- preview -------------------------------------------------------- */
+.frame{position:relative;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#000;line-height:0}
+.frame canvas{display:block;width:100%;height:auto;max-width:100%}
+.scalebar{position:absolute;left:10px;bottom:9px;display:flex;align-items:center;gap:7px;
+          font:11px/1 var(--mono);color:#c9bfb8;text-shadow:0 1px 3px #000}
+.scalebar i{display:block;height:1px;width:52px;background:#c9bfb8}
+
+/* ---- graph ---------------------------------------------------------- */
+.graphwrap{position:relative}
+.graphwrap canvas{display:block;width:100%;height:auto;max-width:100%}
+.legend{display:flex;gap:16px;margin-top:10px;font-size:12px;color:var(--dim);flex-wrap:wrap}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.legend i{width:14px;height:2px;border-radius:1px;display:block}
+
+/* ---- correction bars ------------------------------------------------ */
+.pulses{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.pulse{background:var(--card2);border:1px solid var(--line);border-radius:7px;padding:9px 8px;text-align:center}
+.pulse .d{font-size:10px;letter-spacing:.08em;color:var(--faint)}
+.pulse .ms{font:600 15px/1.3 var(--mono);font-variant-numeric:tabular-nums;margin-top:2px;color:var(--dim)}
+.pulse.on{border-color:rgba(224,82,58,.5);background:rgba(224,82,58,.1)}
+.pulse.on .ms{color:var(--accent)}
+
+/* ---- controls ------------------------------------------------------- */
+.btns{display:flex;gap:8px;flex-wrap:wrap}
+button{font:inherit;color:var(--fg);background:#2b2523;border:1px solid var(--line);
+       border-radius:7px;padding:9px 14px;cursor:pointer;transition:background .13s,border-color .13s}
+button:hover{background:#352d2a}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button.primary{background:var(--accent);border-color:var(--accent);color:#1a0d09;font-weight:600}
+button.primary:hover{background:#ea6044}
+button[disabled]{opacity:.4;cursor:default}
+button.grow{flex:1 1 auto}
+
+/* ---- key/value rows ------------------------------------------------- */
+.kv{display:flex;justify-content:space-between;gap:14px;padding:7px 0;border-bottom:1px solid var(--line);font-size:14px}
+.kv:last-child{border-bottom:0;padding-bottom:0}
+.kv:first-of-type{padding-top:0}
+.kv dt{color:var(--dim);margin:0}
+.kv dd{margin:0;font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right}
+dl{margin:0}
+
+/* ---- fields --------------------------------------------------------- */
+.field{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0}
+.field label{color:var(--dim);font-size:14px}
+select,input[type=range]{font:inherit;color:var(--fg);background:#2b2523;border:1px solid var(--line);
+       border-radius:6px;padding:6px 9px;max-width:60%}
+input[type=range]{padding:0;accent-color:var(--accent);background:none;border:0;width:130px}
+.val{font-family:var(--mono);font-size:13px;min-width:44px;text-align:right;color:var(--fg)}
+.sw{flex:none;width:52px;height:29px;padding:0;border-radius:15px;border:1px solid var(--line);
+    background:#2b2523;position:relative;cursor:pointer}
+.sw[aria-checked=true]{background:var(--accent);border-color:var(--accent)}
+.knob{position:absolute;top:3px;left:3px;width:21px;height:21px;border-radius:50%;background:#efe9e6;transition:transform .15s}
+.sw[aria-checked=true] .knob{transform:translateX(23px)}
+@media (prefers-reduced-motion:reduce){.knob{transition:none}}
+
+footer{color:var(--faint);font-size:12px;text-align:center;margin-top:22px;line-height:1.8}
+footer code{font-family:var(--mono)}
+@media (max-width:420px){
+  .tiles{grid-template-columns:repeat(2,1fr)}
+  .tile:last-child{grid-column:1/-1}
+}
+</style>
+</head>
+<body>
+
+
+<main>
+  <header>
+    <h1>Guiding</h1>
+    <span class="addr">169.254.18.203</span>
+  </header>
+  <div class="demo">Mockup — all values below are simulated</div>
+
+  <!-- STATUS ---------------------------------------------------------- -->
+  <section class="card">
+    <div class="state">
+      <span class="pill guiding" id="statePill"><i class="dot"></i><span id="stateText">Guiding</span></span>
+      <span class="since" id="elapsed">04:17 elapsed · frame 128</span>
+    </div>
+    <div class="tiles">
+      <div class="tile">
+        <div class="k">RMS total</div>
+        <div class="v" id="rmsTot">0.72<span class="u">″</span></div>
+      </div>
+      <div class="tile">
+        <div class="k">RMS RA</div>
+        <div class="v" id="rmsRa">0.58<span class="u">″</span></div>
+      </div>
+      <div class="tile">
+        <div class="k">RMS Dec</div>
+        <div class="v" id="rmsDec">0.43<span class="u">″</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PREVIEW --------------------------------------------------------- -->
+  <section class="card">
+    <h2>Guide star <span class="meta" id="starMeta">SNR 41.2 · HFD 3.1 px · mass 18.4k</span></h2>
+    <div class="frame">
+      <canvas id="preview" width="1024" height="576" aria-label="Live guide camera preview, simulated"></canvas>
+      <div class="scalebar"><i></i><span>2′ · 2.06″/px</span></div>
+    </div>
+    <div class="btns" style="margin-top:12px">
+      <button class="grow" id="btnAuto">Auto-select star</button>
+      <button class="grow" id="btnZoom">Zoom to star</button>
+    </div>
+  </section>
+
+  <!-- GRAPH ----------------------------------------------------------- -->
+  <section class="card">
+    <h2>Guide error <span class="meta">last 100 frames · ±4″</span></h2>
+    <div class="graphwrap">
+      <canvas id="graph" width="1024" height="420" aria-label="Guide error over time in arcseconds, simulated"></canvas>
+    </div>
+    <div class="legend">
+      <span><i style="background:var(--ra)"></i>RA <b id="curRa" style="font-family:var(--mono);font-weight:600">+0.31″</b></span>
+      <span><i style="background:var(--dec)"></i>Dec <b id="curDec" style="font-family:var(--mono);font-weight:600">−0.12″</b></span>
+      <span><i style="background:var(--line)"></i>min-move 0.15″</span>
+    </div>
+  </section>
+
+  <!-- CORRECTIONS ----------------------------------------------------- -->
+  <section class="card">
+    <h2>Last correction <span class="meta">ST-4 · on camera</span></h2>
+    <div class="pulses" id="pulses">
+      <div class="pulse" data-d="W"><div class="d">WEST</div><div class="ms">—</div></div>
+      <div class="pulse" data-d="E"><div class="d">EAST</div><div class="ms">—</div></div>
+      <div class="pulse" data-d="N"><div class="d">NORTH</div><div class="ms">—</div></div>
+      <div class="pulse" data-d="S"><div class="d">SOUTH</div><div class="ms">—</div></div>
+    </div>
+  </section>
+
+  <!-- CONTROLS -------------------------------------------------------- -->
+  <section class="card">
+    <h2>Control</h2>
+    <div class="btns">
+      <button class="primary grow" id="btnStop">Stop guiding</button>
+      <button class="grow" id="btnDither">Dither</button>
+      <button class="grow" id="btnLoop">Loop only</button>
+    </div>
+  </section>
+
+  <!-- CALIBRATION ----------------------------------------------------- -->
+  <section class="card">
+    <h2>Calibration <span class="meta">2026-09-18 21:04</span></h2>
+    <dl>
+      <div class="kv"><dt>RA axis angle</dt><dd>−87.31°</dd></div>
+      <div class="kv"><dt>RA rate</dt><dd>6.41 px/s</dd></div>
+      <div class="kv"><dt>Dec rate</dt><dd>6.28 px/s</dd></div>
+      <div class="kv"><dt>Orthogonality error</dt><dd>1.4°</dd></div>
+    </dl>
+    <div class="btns" style="margin-top:14px">
+      <button id="btnRecal">Recalibrate</button>
+      <button id="btnClear">Clear</button>
+    </div>
+  </section>
+
+  <!-- ALGORITHM ------------------------------------------------------- -->
+  <section class="card">
+    <h2>Algorithm</h2>
+    <div class="field">
+      <label for="algo">Guide algorithm</label>
+      <select id="algo">
+        <option>Hysteresis</option>
+        <option>Lowpass</option>
+        <option>Lowpass2</option>
+        <option>Resist switch</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="aggr">Aggressiveness</label>
+      <span style="display:flex;align-items:center;gap:10px">
+        <input type="range" id="aggr" min="0" max="150" value="70">
+        <span class="val" id="aggrV">70%</span>
+      </span>
+    </div>
+    <div class="field">
+      <label for="hyst">Hysteresis</label>
+      <span style="display:flex;align-items:center;gap:10px">
+        <input type="range" id="hyst" min="0" max="50" value="10">
+        <span class="val" id="hystV">10%</span>
+      </span>
+    </div>
+    <div class="field">
+      <label for="minmove">Minimum move</label>
+      <span style="display:flex;align-items:center;gap:10px">
+        <input type="range" id="minmove" min="0" max="50" value="15">
+        <span class="val" id="minmoveV">0.15″</span>
+      </span>
+    </div>
+    <div class="field" style="border-top:1px solid var(--line);margin-top:6px;padding-top:12px">
+      <label for="decmode">Dec guide mode</label>
+      <select id="decmode">
+        <option>Auto</option><option>North only</option>
+        <option>South only</option><option>Off</option>
+      </select>
+    </div>
+  </section>
+
+  <!-- CAMERA ---------------------------------------------------------- -->
+  <section class="card">
+    <h2>Camera</h2>
+    <div class="field">
+      <label for="exp">Exposure</label>
+      <select id="exp">
+        <option>1.0 s</option><option selected>2.0 s</option>
+        <option>3.0 s</option><option>5.0 s</option>
+      </select>
+    </div>
+    <dl style="margin-top:6px">
+      <div class="kv"><dt>Sensor</dt><dd>SC3336 · 2304×1296</dd></div>
+      <div class="kv"><dt>Image scale</dt><dd>2.06″/px</dd></div>
+      <div class="kv"><dt>Exposure range</dt><dd>0.29 ms – 19.27 s</dd></div>
+    </dl>
+  </section>
+
+  <!-- DEW HEATER ------------------------------------------------------ -->
+  <section class="card">
+    <h2>Dew heater</h2>
+    <div class="field" style="padding:0">
+      <label for="dew" id="dewLabel">Off</label>
+      <button class="sw" id="dew" role="switch" aria-checked="false" aria-labelledby="dewLabel"><span class="knob"></span></button>
+    </div>
+  </section>
+
+  <footer>
+    OpenAstroGuider · <code>2026-09-18 g281d0b9</code><br>
+    Camera and Switch also available over Alpaca · PHD2 protocol on :4400
+  </footer>
+</main>
+
+<script>
+(function(){
+  "use strict";
+  var reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* ---------- simulated guiding -------------------------------------- */
+  var N = 100, ra = [], dec = [], t = 0;
+  var pe = 0, decWalk = 0;
+  function step(){
+    t += 1;
+    /* periodic error (worm) + noise, partially corrected -> residual */
+    pe = Math.sin(t / 19) * 0.85 + Math.sin(t / 6.3) * 0.22;
+    var r = pe * 0.42 + (Math.random() - 0.5) * 0.55;
+    decWalk = decWalk * 0.86 + (Math.random() - 0.5) * 0.30;
+    var d = decWalk;
+    ra.push(r); dec.push(d);
+    if (ra.length > N) { ra.shift(); dec.shift(); }
+    return { r: r, d: d };
+  }
+  for (var i = 0; i < N; i++) step();
+
+  function rms(a){
+    var s = 0; for (var i=0;i<a.length;i++) s += a[i]*a[i];
+    return Math.sqrt(s / a.length);
+  }
+  function fmt(v){ return (v<0?"−":"+") + Math.abs(v).toFixed(2) + "″"; }
+
+  /* ---------- guide error graph -------------------------------------- */
+  var g = document.getElementById("graph"), gx = g.getContext("2d");
+  var RANGE = 4;
+  function css(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+
+  function drawGraph(){
+    var W = g.width, H = g.height, padL = 52, padR = 10, padT = 10, padB = 24;
+    var iw = W - padL - padR, ih = H - padT - padB;
+    gx.clearRect(0,0,W,H);
+    gx.font = "22px ui-monospace, Menlo, monospace";
+    gx.textBaseline = "middle";
+
+    /* gridlines + labels at every value the scale reaches */
+    var ticks = [4,2,0,-2,-4];
+    for (var i=0;i<ticks.length;i++){
+      var v = ticks[i], y = padT + ih/2 - (v/RANGE)*(ih/2);
+      gx.strokeStyle = v === 0 ? css("--line") : css("--card2");
+      gx.lineWidth = v === 0 ? 2 : 1;
+      gx.beginPath(); gx.moveTo(padL, y); gx.lineTo(W-padR, y); gx.stroke();
+      gx.fillStyle = css("--faint");
+      gx.textAlign = "right";
+      gx.fillText((v>0?"+":"") + v + "″", padL - 10, y);
+    }
+
+    /* min-move band */
+    var mm = 0.15, y0 = padT + ih/2 - (mm/RANGE)*(ih/2), y1 = padT + ih/2 + (mm/RANGE)*(ih/2);
+    gx.fillStyle = "rgba(156,147,141,.10)";
+    gx.fillRect(padL, y0, iw, y1-y0);
+
+    function trace(arr, color){
+      gx.strokeStyle = color; gx.lineWidth = 2.5;
+      gx.lineJoin = "round"; gx.lineCap = "round";
+      gx.beginPath();
+      for (var i=0;i<arr.length;i++){
+        var x = padL + (i/(N-1))*iw;
+        var y = padT + ih/2 - (Math.max(-RANGE,Math.min(RANGE,arr[i]))/RANGE)*(ih/2);
+        i ? gx.lineTo(x,y) : gx.moveTo(x,y);
+      }
+      gx.stroke();
+      /* emphasized endpoint */
+      var lx = padL + iw, ly = padT + ih/2 - (Math.max(-RANGE,Math.min(RANGE,arr[arr.length-1]))/RANGE)*(ih/2);
+      gx.fillStyle = color; gx.beginPath(); gx.arc(lx, ly, 4.5, 0, 6.284); gx.fill();
+    }
+    trace(dec, css("--dec"));
+    trace(ra,  css("--ra"));
+
+    gx.fillStyle = css("--faint"); gx.textAlign = "left";
+    gx.fillText("100 frames ago", padL, H - 11);
+    gx.textAlign = "right";
+    gx.fillText("now", W - padR, H - 11);
+  }
+
+  /* ---------- star field preview ------------------------------------- */
+  var p = document.getElementById("preview"), px = p.getContext("2d");
+  var stars = [];
+  (function seed(){
+    var s = 7;
+    function rnd(){ s = (s*1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; }
+    for (var i=0;i<70;i++)
+      stars.push({ x: rnd()*p.width, y: rnd()*p.height, m: 0.9 + rnd()*2.6, b: 0.25 + rnd()*0.75 });
+    /* the guide star: bright, near centre */
+    stars.push({ x: p.width*0.46, y: p.height*0.52, m: 5.2, b: 1, guide: true });
+  })();
+
+  function drawPreview(off){
+    px.fillStyle = "#07070a"; px.fillRect(0,0,p.width,p.height);
+    /* faint sensor noise */
+    px.fillStyle = "rgba(255,255,255,.022)";
+    for (var i=0;i<220;i++) px.fillRect(Math.random()*p.width, Math.random()*p.height, 1.5, 1.5);
+
+    var gs = null;
+    for (var j=0;j<stars.length;j++){
+      var st = stars[j];
+      var x = st.x + off.x, y = st.y + off.y;
+      var gr = px.createRadialGradient(x, y, 0, x, y, st.m*3.4);
+      gr.addColorStop(0,   "rgba(255,246,238," + st.b + ")");
+      gr.addColorStop(0.35,"rgba(255,226,206," + (st.b*0.45) + ")");
+      gr.addColorStop(1,   "rgba(255,210,180,0)");
+      px.fillStyle = gr;
+      px.beginPath(); px.arc(x, y, st.m*3.4, 0, 6.284); px.fill();
+      if (st.guide) gs = { x: x, y: y };
+    }
+    if (gs){
+      /* PHD2-style lock reticle */
+      px.strokeStyle = css("--accent"); px.lineWidth = 2;
+      var R = 34;
+      px.strokeRect(gs.x-R, gs.y-R, R*2, R*2);
+      px.beginPath();
+      px.moveTo(gs.x-R-13, gs.y); px.lineTo(gs.x-R-3, gs.y);
+      px.moveTo(gs.x+R+3, gs.y);  px.lineTo(gs.x+R+13, gs.y);
+      px.moveTo(gs.x, gs.y-R-13); px.lineTo(gs.x, gs.y-R-3);
+      px.moveTo(gs.x, gs.y+R+3);  px.lineTo(gs.x, gs.y+R+13);
+      px.stroke();
+    }
+  }
+
+  /* ---------- pulses -------------------------------------------------- */
+  var pulseEls = {};
+  [].forEach.call(document.querySelectorAll(".pulse"), function(el){ pulseEls[el.dataset.d] = el; });
+  function showPulse(r, d){
+    for (var k in pulseEls){ pulseEls[k].classList.remove("on"); pulseEls[k].querySelector(".ms").textContent = "—"; }
+    var mm = 0.15;
+    if (Math.abs(r) > mm){
+      var k1 = r > 0 ? "W" : "E", ms = Math.round(Math.abs(r) * 120);
+      pulseEls[k1].classList.add("on"); pulseEls[k1].querySelector(".ms").textContent = ms + " ms";
+    }
+    if (Math.abs(d) > mm){
+      var k2 = d > 0 ? "N" : "S", ms2 = Math.round(Math.abs(d) * 120);
+      pulseEls[k2].classList.add("on"); pulseEls[k2].querySelector(".ms").textContent = ms2 + " ms";
+    }
+  }
+
+  /* ---------- tick ---------------------------------------------------- */
+  var frame = 128, secs = 257, running = true;
+  function pad(n){ return (n<10?"0":"") + n; }
+  function tick(){
+    if (!running) return;
+    var v = step();
+    frame++; secs += 2;
+    drawGraph();
+    drawPreview({ x: v.r * 3.2, y: v.d * 3.2 });
+    showPulse(v.r, v.d);
+    document.getElementById("curRa").textContent  = fmt(v.r);
+    document.getElementById("curDec").textContent = fmt(v.d);
+    document.getElementById("rmsTot").innerHTML = rms(ra.concat(dec)).toFixed(2) + '<span class="u">″</span>';
+    document.getElementById("rmsRa").innerHTML  = rms(ra).toFixed(2)  + '<span class="u">″</span>';
+    document.getElementById("rmsDec").innerHTML = rms(dec).toFixed(2) + '<span class="u">″</span>';
+    document.getElementById("elapsed").textContent =
+      pad(Math.floor(secs/60)) + ":" + pad(secs%60) + " elapsed · frame " + frame;
+    document.getElementById("starMeta").textContent =
+      "SNR " + (38 + Math.random()*7).toFixed(1) + " · HFD " + (2.9 + Math.random()*0.5).toFixed(1) +
+      " px · mass " + (17.5 + Math.random()*2).toFixed(1) + "k";
+  }
+
+  drawGraph(); drawPreview({x:0,y:0}); showPulse(ra[N-1], dec[N-1]);
+  if (!reduce) setInterval(tick, 2000);
+
+  /* ---------- controls ------------------------------------------------ */
+  var stop = document.getElementById("btnStop");
+  stop.addEventListener("click", function(){
+    running = !running;
+    var pill = document.getElementById("statePill");
+    document.getElementById("stateText").textContent = running ? "Guiding" : "Stopped";
+    pill.classList.toggle("guiding", running);
+    pill.classList.toggle("lost", !running);
+    stop.textContent = running ? "Stop guiding" : "Start guiding";
+  });
+  document.getElementById("btnDither").addEventListener("click", function(){
+    var pill = document.getElementById("statePill");
+    document.getElementById("stateText").textContent = "Settling";
+    pill.classList.remove("guiding");
+    decWalk += 2.2; pe += 1.6;
+    setTimeout(function(){
+      document.getElementById("stateText").textContent = running ? "Guiding" : "Stopped";
+      pill.classList.toggle("guiding", running);
+    }, 4000);
+  });
+
+  function bindRange(id, fmtFn){
+    var el = document.getElementById(id), out = document.getElementById(id + "V");
+    el.addEventListener("input", function(){ out.textContent = fmtFn(+el.value); });
+  }
+  bindRange("aggr",    function(v){ return v + "%"; });
+  bindRange("hyst",    function(v){ return v + "%"; });
+  bindRange("minmove", function(v){ return (v/100).toFixed(2) + "″"; });
+
+  var dew = document.getElementById("dew");
+  dew.addEventListener("click", function(){
+    var on = dew.getAttribute("aria-checked") === "true";
+    dew.setAttribute("aria-checked", String(!on));
+    document.getElementById("dewLabel").textContent = !on ? "On" : "Off";
+  });
+})();
+</script>
+
+</body>
+</html>
