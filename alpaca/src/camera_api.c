@@ -181,6 +181,12 @@ static void *exposure_worker(void *arg) {
 	 * Analogue gain is pinned and is not touched here. */
 	int64_t vblank_cur = 0, vblank_min = 0, vblank_max = 0;
 	int64_t exp_min = 0, exp_max_cur = 0, exp_cur = 0;
+
+	/* Held across the control writes, the settle reference and the capture --
+	 * that whole span is the atomic unit, and the guide loop is now a second
+	 * caller of it. See v4l2_capture.h. */
+	v4l2_exposure_lock();
+
 	v4l2_ctrl_get(s->subdev_path, s->ctrl_vblank, &vblank_cur);
 	v4l2_ctrl_get(s->subdev_path, s->ctrl_exposure, &exp_cur);
 	v4l2_ctrl_get_range(s->subdev_path, s->ctrl_vblank, &vblank_min, &vblank_max);
@@ -247,6 +253,7 @@ static void *exposure_worker(void *arg) {
 	double t_capture_start = now_ms();
 	v4l2_frame_t frame;
 	int ok = (v4l2_capture_frame(&frame, frame_period_s, settle_ref_ns) == 0);
+	v4l2_exposure_unlock();
 	double t_capture_end = now_ms();
 	fprintf(stderr,
 	        "[t=%.0f] [exposure] v4l2_capture_frame took %.0fms (ctrl setup "

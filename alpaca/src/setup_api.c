@@ -95,6 +95,16 @@ static const char PAGE_HEAD[] =
     "</dl>\n"
     "</section>\n"
 
+    /* The guider has its own page; this is the only place a user arriving via
+     * a client's "Settings" button would find it. */
+    "<section class='card'>\n"
+    "<h2>Guiding</h2>\n"
+    "<p class='hint' style='margin:0 0 14px'>Star detection and guide-error "
+    "measurement run on the camera itself.</p>\n"
+    "<p style='margin:0'><a href='/guide' style='color:var(--accent)'>"
+    "Open the guider &rarr;</a></p>\n"
+    "</section>\n"
+
     "<p class='foot'>Changes apply immediately and survive a power cycle.<br>\n"
     "Served by the camera itself &mdash; no internet connection is used.</p>\n"
     "</main>\n";

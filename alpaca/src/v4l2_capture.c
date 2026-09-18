@@ -62,6 +62,24 @@ static int find_ctrl(int fd, const char *name, struct v4l2_query_ext_ctrl *qc) {
  * exposure thread and CivetWeb's handler threads both come through here. */
 #define CTRL_CACHE_MAX 8
 static pthread_mutex_t g_ctrl_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * Serialises a whole "set controls, then capture the frame that reflects them"
+ * sequence. g_ctrl_lock above only guards individual control ioctls, which is
+ * not enough: the unit that must be atomic spans the control writes, the
+ * settle reference timestamp taken right after them, and the capture itself.
+ * Two threads interleaving there share one fd and one mmap'd buffer pool, and
+ * which thread receives which frame becomes undefined.
+ *
+ * There are now two callers -- the Alpaca exposure worker and the guide loop --
+ * so this is load-bearing rather than theoretical. It also closes the
+ * concurrent-exposure_worker race noted in the project's open issues: a second
+ * startexposure arriving mid-capture now waits instead of racing.
+ */
+static pthread_mutex_t g_exposure_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void v4l2_exposure_lock(void) { pthread_mutex_lock(&g_exposure_lock); }
+void v4l2_exposure_unlock(void) { pthread_mutex_unlock(&g_exposure_lock); }
 static int g_sub_fd = -1;
 static char g_sub_path[128];
 static struct {

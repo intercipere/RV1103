@@ -66,6 +66,17 @@ int v4l2_capture_frame(v4l2_frame_t *out, double frame_period_s,
                        uint64_t settle_ref_ns);
 
 /*
+ * Serialises an entire "set controls -> sample settle_ref -> capture" sequence.
+ * Every caller of v4l2_capture_frame() must hold this across its control writes
+ * as well as the capture, not just around the capture: the sequence is the
+ * atomic unit. Two threads sharing the fd and the mmap'd buffer pool without it
+ * produce undefined frame-to-caller assignment. Callers: the Alpaca exposure
+ * worker and the guide loop.
+ */
+void v4l2_exposure_lock(void);
+void v4l2_exposure_unlock(void);
+
+/*
  * Current time on the same clock rkcif stamps buffers with, for settle_ref_ns.
  * Callers must use this rather than their own clock_gettime(), because the two
  * have to be comparable.

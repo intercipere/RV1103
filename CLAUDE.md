@@ -869,8 +869,9 @@ Open next steps, roughly in order of value:
    arrive correctly and that the extra frame period per exposure is acceptable in a real guiding loop.
    Also still unconfirmed from the previous session: that PHD2's camera **Settings** button lands on the
    setup page and its dew-heater toggle.
-2. **Implement exposure abort properly** (see the section above). Three parts: a mutex on the capture
-   path (fixes a real data race where two workers share the V4L2 fd), a genuine cancellable wait, and a
+2. **Implement exposure abort properly** (see the section above). The capture-path mutex is **done** —
+   `v4l2_exposure_lock()`, added for the guide loop (see the guiding section at the end of this file),
+   which closes the two-workers-share-the-fd race. Still outstanding: a genuine cancellable wait, and a
    stream restart so a shortened exposure does not have to wait out the previous long frame. Measured
    symptom: 16.6s to deliver a 0.5s exposure requested during a 19s one.
 3. **Run the ASCOM Conformance tool.** Never done. It probes edge cases hand-testing does not, and the
@@ -907,3 +908,57 @@ the datasheets, and the Luckfox-stripping question — see `alpaca/README.md` an
 short version is that `imx327.c` is a full Rockchip vendor driver (not a stub) with the same control model
 as `sc3336.c`, and slave mode genuinely bypasses VMAX (frame period comes from external XVS), so exposure
 length there has no register-width ceiling.
+
+## On-device guiding: PHD2 port, wired into alpacad and serving (2026-09-18)
+
+Full detail lives in `Guiding/README.md` (feasibility and the measurements behind it),
+`Guiding/ROADMAP.md` (what is missing, what each piece costs, and the mount-interface
+options) and `alpaca/src/guide/README.md` (how the implementation is put together). Summary:
+
+**The governing rule for this subsystem: port PHD2, do not reinvent it.** PHD2 is BSD
+3-clause and a decade of real-sky tuning is in its constants. This was learned the expensive
+way — of four guide algorithms first written here, two were ported from source and two were
+written from what the name implies, and one of those (resist-switch) was simply a different
+algorithm. Defaults were also applied globally where PHD2 sets them per algorithm (aggression
+0.7 hysteresis / 1.0 resist-switch), under-correcting Dec by 30%. Neither failed visibly;
+both would have surfaced as mediocre guiding on sky. Before implementing anything else, open
+the corresponding PHD2 file and port it.
+
+**What works, hardware-verified:** star detection and centroid tracking (`Star::Find`,
+0.18 ms/frame, centroid error 0.009 px mean against injected ground truth), star
+auto-selection (`Star::AutoFind`, restructured into bands: 321 ms and 0.69 MB at 4x
+downsample where PHD2's arrangement needs 35.8 MB and is OOM-killed here), four guide
+algorithms, and a loop inside `alpacad` serving a page at `/guide` with live preview, error
+graph, star cycling, and a camera/simulated frame-source toggle. PHD2's loop-vs-guide
+distinction is preserved: `stopped -> looping -> selecting -> selected -> guiding`.
+
+**What does not exist: calibration and mount output.** It measures guiding; it does not
+perform it. Without calibration the axes are camera x/y, not RA/Dec, which is why the page
+reports pixels.
+
+**`v4l2_exposure_lock()` is new and load-bearing.** The atomic unit is "write controls ->
+sample the settle reference -> capture"; `g_ctrl_lock` only guarded individual ioctls. With
+the guide loop as a second caller this became real, and it closes the concurrent-
+`exposure_worker` race listed as open above. Every caller of `v4l2_capture_frame()` must hold
+it across its control writes, not just the capture.
+
+**Memory, on this 32 MB board.** `alpacad` retains a whole 5.97 MB frame after every exposure
+(VmRSS 12.5 -> 18.4 MB, measured) and holds two while capturing the next. Consequences,
+learned by OOM-killing the daemon four times: a separate guide process pulling frames over
+HTTP does not fit (hence the loop lives *inside* `alpacad`), the loop must release its frame
+as soon as the centroid and preview are extracted, and `/guide/preview` must allocate exactly
+the preview size. With those, guide loop plus concurrent Alpaca captures peaks at VmHWM
+25.8 MB and stays up. On the 256 MB RV1106G3 none of this applies.
+
+**The page never sees a full frame:** `/guide/preview` is a downsampled 8-bit buffer
+(576x324, 182 kB) rendered by canvas `putImageData`. No encoder — there is no zlib/libjpeg/
+libpng in the rootfs and the hardware JPEG encoder is behind the stripped-out MPP stack.
+
+**Mount interface, researched but not built.** ASCOM's *Camera* interface has
+`CanPulseGuide`/`PulseGuide`/`IsPulseGuiding`, specified for a camera with an ST-4 port —
+that is the inbound direction (a PC client driving our port); our own loop would call the
+GPIO driver directly. OpenAstroTech needs no custom protocol: its firmware speaks Meade/LX200
+and `:MG<dir><DDDD>#` is a guide pulse in ms (`src/core/meade/MeadeParserMovement.cpp`), with
+`:GR#`/`:GD#`/`:GX#` reporting RA, Dec and status back. **That telemetry is the real argument
+for fitting a UART header alongside the ST-4 jack** — ST-4 is write-only, so declination
+compensation and flip awareness are impossible over it. Both are cheap; fit both.

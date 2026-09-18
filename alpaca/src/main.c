@@ -9,6 +9,8 @@
 #include "civetweb.h"
 #include "device_state.h"
 #include "discovery.h"
+#include "guide/guide_api.h"
+#include "guide/guide_loop.h"
 #include "management_api.h"
 #include "setup_api.h"
 #include "switch_api.h"
@@ -71,6 +73,16 @@ int main(void) {
 	 * and the only way to reach the dew heater from a client with no ASCOM
 	 * Switch support. See setup_api.h. */
 	setup_api_register(ctx);
+
+	/* The guider: a page at /guide plus its data endpoints. The loop thread
+	 * starts here but idles -- it acquires nothing until the page (or a PUT to
+	 * /guide/control) asks it to, so an installation that only ever uses the
+	 * Alpaca camera pays nothing for it. It shares the streaming V4L2 device
+	 * with the exposure worker under v4l2_exposure_lock(). */
+	if (guide_loop_init(g_device.sensor) == 0)
+		guide_api_register(ctx);
+	else
+		fprintf(stderr, "[guide] loop failed to start; /guide not served\n");
 
 	printf("alpacad listening on :%d (discovery UDP :32227)\n", ALPACA_TCP_PORT);
 	for (;;)
