@@ -1169,7 +1169,9 @@ so moving to 256 MB later means a new layout. One sensor footprint takes IMX327L
 IMX290LLR (there is no IMX327 mono). The sensor-side IO bank (VCCIO7) is 1.8 V natively — no level
 shifters. Reference design: Luckfox Pico Mini schematic (`PCB/reference/`), ported selectively.
 
-**PCB REQUIREMENTS REVISED (2026-10-15): read `PCB/HARDWARE-DESIGN-NOTES.md` §0 and §16 before §15.**
+**PCB HANDOFF (end of 2026-10-15): read `PCB/HARDWARE-DESIGN-NOTES.md` §17, then §0 and §16, before §15.**
+Requirements were revised; EasyEDA was not touched. Wi-Fi module Ebyte E103-RTL8189FTV is recommended
+but awaits the user's decision.
 One PCB now serves two products (OAG guider + a battery-powered Wi-Fi remote camera for Zenit
 Astronomy) as assembly variants; outline 50 × 50 mm trimmed to Ø56.5 (tube OD 59 mm); USB-C is the
 only power input (no diode-OR/mux); Wi-Fi module added; mount power + half-duplex UART arrive through
