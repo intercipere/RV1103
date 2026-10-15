@@ -724,6 +724,11 @@ side still probes, and it would move away from a collision on its own.
 
 ## HTS/row-time scaling shipped, default 12x (2026-09-17)
 
+**[SUPERSEDED 2026-10-07: the shipped value is now `hts_mult=4` -- 6.42 s ceiling, 133 ms shortest
+frame, 7.5 frames/s -- because guiding needs at most ~5 s and 12x capped the guide loop at 2.5
+frames/s. The table below also predates the 12% row-time correction; the corrected table is in the
+overlay's `insmod_ko.sh`.]**
+
 `SC3336_VTS_MAX` is now at the VTS register's 16-bit maximum, so row time is the only remaining lever on
 the exposure ceiling (ceiling = VTS_MAX x row_time). `sc3336.ko` gained an `hts_mult` module parameter,
 **set in the overlay's `insmod_ko.sh`, not baked into the driver**, so it is changeable with no rebuild.
@@ -848,6 +853,9 @@ misrepresentation and is likely to show up in an ASCOM Conformance run.
 
 ## Where this stands (end of session, 2026-09-17)
 
+**[SUPERSEDED -- see "Where this stands (2026-10-07)" at the end of this file. In particular
+`hts_mult` is now 4, not 12, and the guide loop now has calibration and a new UI.]**
+
 **Working tree is clean** apart from an untracked `PCB/` directory, which is not mine and was left alone.
 Row time is now measured-correct (24.51 us/row at `hts_mult=1`, 294.12 us at 12) — treat any older
 "27.45 us/row" reference in this file as wrong.
@@ -932,9 +940,9 @@ algorithms, and a loop inside `alpacad` serving a page at `/guide` with live pre
 graph, star cycling, and a camera/simulated frame-source toggle. PHD2's loop-vs-guide
 distinction is preserved: `stopped -> looping -> selecting -> selected -> guiding`.
 
-**What does not exist: calibration and mount output.** It measures guiding; it does not
-perform it. Without calibration the axes are camera x/y, not RA/Dec, which is why the page
-reports pixels.
+**What does not exist: mount output to real hardware.** Calibration now exists (see the
+2026-10-07 section at the end); without a connected mount the loop still only measures, in
+camera pixels.
 
 **`v4l2_exposure_lock()` is new and load-bearing.** The atomic unit is "write controls ->
 sample the settle reference -> capture"; `g_ctrl_lock` only guarded individual ioctls. With
@@ -962,3 +970,283 @@ and `:MG<dir><DDDD>#` is a guide pulse in ms (`src/core/meade/MeadeParserMovemen
 `:GR#`/`:GD#`/`:GX#` reporting RA, Dec and status back. **That telemetry is the real argument
 for fitting a UART header alongside the ST-4 jack** — ST-4 is write-only, so declination
 compensation and flip awareness are impossible over it. Both are cheap; fit both.
+
+## Calibration ported, tested against a simulated mount (2026-10-07)
+
+Board was not connected this session, so everything here is **host-verified only**; the
+alpacad binary cross-compiles cleanly (`-Wall -Wextra`, no warnings) but has **not** run on
+the board. Full detail in `alpaca/src/guide/README.md`, "Calibration".
+
+- **`guide_cal.c`**: PHD2's calibration state machine (`Scope::UpdateCalibrationState`:
+  west / east / clear-backlash / north / south / nudge), the camera<->mount transforms, the
+  calibrated guide step (`MoveOffset` + `MoveAxis` limits), Dec guide mode and the
+  `IsCalibrated` rule. Ported line by line from a fresh clone of PHD2 (commit `0f9f905`),
+  constants unchanged. Not ported, because nothing here reports mount position: guide
+  parity, Dec compensation, meridian flip. Calibration is not persisted across restarts.
+- **`guide_mount.c`**: `guide_mount_pulse(dir, ms)`, the single entry point ST-4 / LX200 /
+  Camera `PulseGuide` will sit behind. The only backend is the simulated one.
+- **The simulated source now carries a simulated mount**: rotation, Dec mirror, guide rates,
+  Dec backlash, RA periodic error, Dec drift, seeing — none of it told to the guider.
+- **`make test`** (`guide_cal_test`): calibration recovers the hidden geometry and guiding
+  cuts true RMS ~3.0 -> ~0.36 px at every geometry; dead-RA and dead-Dec mounts fail with
+  PHD2's own messages. Mutation-tested (a flipped pulse sign or swapped angle convention
+  fails it). One Dec angle is 6.7 deg off, proven to be RA periodic error during the Dec leg
+  (0.09 deg with PE off) — PHD2 has the same exposure; the tolerance is derived from PE.
+- **`make guide_serve`**: the real `guide_loop.c` + `guide_api.c` + page on a host with the
+  simulated source, for driving the page in a browser without a board. Used to verify the
+  page end to end (calibrate, recalibrate, clear, Dec mode, stop/start, source switch).
+- **Fixed:** after Stop -> Start the guide loop always reopened the camera even with
+  Simulated selected.
+
+Same day, on request: the guide preview now draws a **box around the guide star** and a
+**crosshair at the lock position** (PHD2's markers; no candidate markers), with positions sent
+in the preview's own headers so they always match the frame. The page polls every 250 ms
+instead of 1 s. Asked why "Frame acquire" reads ~400 ms: it is the **sensor's minimum frame
+period at `hts_mult=12`** ((1296+64) rows x 294.12 us = 400 ms), not download time. The real
+fix is choosing `hts_mult` per exposure at runtime (needs a driver change + the board) --
+proposed, not started. Multi-star guiding: still not implemented.
+
+**Then, same day, on the board (hardware-verified):** `hts_mult` changed **12 -> 4** in the
+overlay's `insmod_ko.sh` (guiding needs <=5 s; ceiling now **6.42 s**, shortest frame 133 ms;
+this also caps Alpaca clients' `ExposureMax`). The guide loop then hit a CPU limit at
+5.5 fps: `build_preview()` cost ~100 ms walking the column-major frame row-wise; fixed to
+storage order (~40 ms, byte-identical output), giving **7.6 frames/s** at 0.1 s -- the sensor
+limit. Page polls every 100 ms. The board and the overlay copy of `alpacad` now run this
+session's build (md5 `4a27cce8...`), with the previous binary and `insmod_ko.sh` backed up in
+`/userdata/` on the board. The user's "no box/crosshair" report was the board still running
+the 2026-09-18 binary -- nothing from this session had been pushed yet. Hot-push note:
+`adb shell "setsid sh -c '...' &"` alone dies with the adb session; add `& sleep 1`.
+
+Next for guiding, in order: run calibration on the sim source on the board (the build is
+there now, but only looping/guiding on the camera has run on-device); write the ST-4 and LX200 backends behind
+`guide_mount_pulse()`; persist calibration to `/userdata`; then a night on a real mount.
+
+**UI direction change (2026-10-07, user request):** stop hand-building the guide page setting
+by setting. Port PHD2's *interface* as data, from PHD2's own sources (config keys/defaults,
+dialog labels/tooltips/ranges, the `help/*.htm` manual) into a generated settings registry,
+rendered generically; phone + desktop (PHD2-like) layouts. Plan, not started:
+`Guiding/UI_PORTING_PLAN.md`. Already done the same day: PHD2's exact overlay styles (box
+colours per state, dotted-yellow calibration / solid-green guiding full-width lock crosshair)
+and graph colours (RA (100,100,255), Dec red), deployed to the board.
+
+**UI port, step 1 + views done (2026-10-07, host- and board-verified).** User decisions: one
+adaptive page; movable/closable panels with per-browser saved layout (phone and desktop kept
+separately); single profile for now; schemes Dark (default) / OLED / Light / Night (red);
+focal length 182 mm (`/frame/focalLength`, the first setting in the new on-device store at
+`/userdata/guide.cfg`). The page now lives in `alpaca/web/` (embedded pre-gzipped at build,
+`tools/embed_web.py`); graph, target and star profile are ports of `graph.cpp`,
+`target.cpp`, `star_profile.cpp`. Also fixed: SC3336 pixel size was **2.0 um, really 2.45**
+(served to Alpaca clients as PixelSizeX/Y, so their plate scale was ~18% off); image scale at
+182 mm is now 2.78''/px (IMX290/327: 2.9 um -> 3.29''/px). Board still runs 7.5 frames/s,
+RSS 19.3 MB. Next: the settings registry extracted from PHD2 (plan step 2).
+
+## Where this stands (2026-10-07)
+
+Supersedes the 2026-09-17 status section above. **Nothing from 2026-10-07 is committed yet**;
+the working tree holds all of it (plus the untracked `PCB/`, not ours).
+
+**On the board right now** (hot-pushed via adb, `sync`'d; md5 matches the overlay copy, so a
+reflash reproduces it): `alpacad` with calibration, the simulated mount, the new PHD2-style page,
+the settings store and the corrected pixel size; `insmod_ko.sh` with `hts_mult=4`. The previous
+binary and module script are backed up on the board as `/userdata/alpacad.2026-09-18` and
+`/userdata/insmod_ko.sh.hts12`. The board's page: **http://169.254.232.63:11111/guide** (address
+derived from the chip serial; `dmesg | grep 'OAG: usb0'` prints it).
+
+**Done in this session**, all documented in detail elsewhere:
+- Calibration ported from PHD2 + simulated mount + `make test` (`alpaca/src/guide/README.md`,
+  "Calibration"); host-verified, mutation-tested; not yet run against a real mount.
+- `hts_mult` 12 -> 4 (6.42 s ceiling) and a 2.5x faster preview build: guide loop 2.5 -> 7.5
+  frames/s on the board.
+- UI rebuilt as a port of PHD2's interface (`Guiding/UI_PORTING_PLAN.md`): page moved to
+  `alpaca/web/`, movable panels, PHD2 graph/target/star profile/overlay, colour schemes,
+  100 ms polling with incremental history.
+- Settings store under PHD2 keys, `/userdata/guide.cfg`; focal length 182 mm.
+- SC3336 pixel size 2.0 -> 2.45 um (Alpaca `PixelSizeX/Y` was ~18% off).
+- Fixed: Stop -> Start reopened the camera even with Simulated selected.
+
+## Open to-dos (consolidated 2026-10-07)
+
+The single list of what is open. Detail lives in `Guiding/ROADMAP.md` (guiding effort table),
+`Guiding/UI_PORTING_PLAN.md` (interface) and `alpaca/README.md` "Known gaps" (driver). When an
+item closes, strike it here as well.
+
+**Housekeeping**
+- Commit the 2026-10-07 work (nothing from that day is committed).
+- Rebuild the SD-card image: the board runs newer `alpacad`, `insmod_ko.sh` and `sc3336.ko` than
+  the last `./build.sh` output, so reflashing `output/image/sd_update.img` would roll them back.
+
+**Guiding** (port each from PHD2 source, never from a description)
+1. Mount output: ST-4 over GPIO and LX200 (`:Mg<dir><ms>#`) behind `guide_mount_pulse()`, then
+   Camera `PulseGuide`. Until then the real camera guides nothing.
+2. Persist calibration in the settings store (`/userdata/guide.cfg`).
+3. A night on a real mount to validate calibration and guiding.
+4. Position-dependent calibration (parity, Dec compensation, meridian flip) -- needs LX200.
+5. Smaller ports: dead reckoning on lost frames, star mass-change rejection, dithering + settle,
+   multi-star guiding, Lowpass2/ZFilter, bad-pixel map / dark library, backlash compensation,
+   guide log, PHD2 event server on :4400 (N.I.N.A.).
+
+**Interface** (port PHD2's interface as data -- see the UI plan)
+1. Settings registry extracted from PHD2's source (next step); brings the inline algorithm
+   controls under the graph with it.
+2. Click the image to select a star.
+3. Remaining PHD2 views: image overlays (bullseye, grids, RA/Dec axes), fuller Stats, graph
+   line-colour pickers, dither labels.
+4. A full-resolution zoom around the star (the preview is 4x downsampled).
+5. Equipment profiles (single profile for now, keyed for later).
+6. Move the setup page (`setup_api.c`) to `web/` like the guide page.
+
+**Camera / driver**
+1. Runtime `hts_mult` per exposure (sensor driver): 33 ms frames for short exposures.
+2. Real exposure abort (cancellable wait + stream restart); `CanAbortExposure` is `true` today
+   without working.
+3. Retest PHD2 / N.I.N.A. / SharpCap against the current build (new pixel size 2.45 um, new
+   `ExposureMax` 6.42 s, stale-frame fix never client-tested).
+4. ASCOM Conformance run.
+5. Binning / subframing (Bayer design decision on SC3336; trivial on the mono IMX).
+6. Unpin gain.
+7. Time the `quiet` bootarg; measure CDC-NCM vs RNDIS.
+
+**Longer term:** trim ISP/RGA/MPP/NPU from the kernel config; SPI NAND board config (thunderboot);
+retarget to RV1106G3 + IMX.
+
+**Not yet verified:** the page on a real phone (tested in a 390 px frame in desktop Chrome), a
+real star field, the red "star lost" box, calibration on the board itself (only the camera loop
+ran on-device).
+
+Follow-up the same day (board-verified): the simulator now paces at one frame per exposure
+(measured 0.10/0.50/2.00 s per frame; was a fixed 700 ms); the overlay is drawn on its own
+screen-resolution canvas instead of into the 576x324 preview (the "JPEG-like" smearing was the
+3x upscale -- there is no encoder anywhere); graph, image, target and star profile panels are
+height-resizable by a grip, saved per layout.
+
+**Incident, same day: the B-spline zoom pegged the user's PC.** The ported wxWidgets resampler
+ran at the zoom box's full device-pixel size on every frame. Measured: 48 ms per frame in a large
+star-profile panel at 1x DPI (~4x that on high-DPI), at 7.5 frames/s -- more than a CPU core, plus a
+fresh 30 MB buffer each frame. Fixed by capping the resample at 256x256 (the browser scales the
+already-smooth result; a 30 px source has no more detail), caching the weight tables and reusing the
+buffer: 8 ms per frame, independent of panel size. The board was reported unreachable at the same
+time; it had been replugged before it could be inspected, so its side is unproven -- what was
+visible afterwards was healthy. **If the board drops off again, run `adb shell dmesg | tail -30`
+and `adb shell cat /tmp/alpacad.log` before replugging**: both are lost on reboot. Lesson: any
+per-frame browser work must be bounded by a constant, not by panel or screen size.
+
+
+## PCB design: Claude Code <-> EasyEDA Pro bridge (set up 2026-10-14)
+
+PCB work happens in **EasyEDA Pro** (Linux desktop client, running on this machine), project
+**`OAG_IMX327`** (`intercipere/OAG_IMX327`): `Board1` with `Schematic1` (one A4 page `P1`, still
+empty) and `PCB1`, plus `Panel1`. Datasheets and the extracted design notes are in `PCB/`
+(`PCB/HARDWARE-DESIGN-NOTES.md` is the reference to design from; it was not written by the
+EasyEDA session and should be read first).
+
+**How Claude talks to EasyEDA:** the official `easyeda/easyeda-api-skill` (JLCEDA, MIT), installed
+as a user skill at `~/.claude/skills/easyeda-api` (git clone at commit `c0c0989`, so `git pull`
+updates it). Its `SKILL.md` and `references/`/`format/` docs are the API reference -- look up
+`eda.*` calls there rather than guessing. Chain:
+Claude -> `curl` -> Node bridge (`scripts/bridge-server.mjs`, `127.0.0.1:49620`, range 49620-49629)
+-> WebSocket -> **run-api-gateway** extension inside EasyEDA (installed, from
+https://jlc-ext.com/item/oshwhub/run-api-gateway) -> arbitrary JavaScript executed in the editor.
+Edits apply live to the open project; there is no dry-run.
+
+- **Node.js 22.23.3** lives in `~/.local/opt/node-v22.23.3-linux-x64`, symlinked into `~/.local/bin`
+  (Ubuntu 22.04's apt Node is 12, too old). Installed from nodejs.org, SHA256-verified.
+- **Starting the bridge is the user's job each session** -- the auto-mode classifier blocks Claude
+  from launching it. User runs:
+  `! cd ~/.claude/skills/easyeda-api && (setsid node scripts/bridge-server.mjs > /tmp/easyeda-bridge.log 2>&1 &) ; sleep 1; curl -s http://127.0.0.1:49620/health`
+  then `edaConnected:true` once EasyEDA is open with the extension loaded (it auto-connects).
+- **Executing code is allowed by a permission rule** in `.claude/settings.local.json` (machine-local,
+  not gitignored -- don't commit it): `Bash(curl -s -X POST http://127.0.0.1:49620/execute:*)`.
+  Use exactly that prefix form. If the bridge lands on another port, the rule must be updated.
+  Status reads (`GET /health`, `GET /eda-windows`) need no rule.
+- Verified end to end: `return await eda.dmt_Project.getCurrentProjectInfo();` returned the project.
+- **Security note:** the bridge sends `Access-Control-Allow-Origin: *`, so any web page open in a
+  browser could POST code to it while it runs. Run it only during PCB sessions.
+- Working rule agreed: **read-only calls first**, propose a sheet/block plan, and get the user's go
+  before placing or editing anything in the live project.
+
+**PCB baseline agreed (2026-10-14) — see `PCB/HARDWARE-DESIGN-NOTES.md` §0 and §12.** The board uses
+an **RV1103G1** (cost), not the RV1106G3 named above: RV1106 is a different package (QFN128, DDR3L),
+so moving to 256 MB later means a new layout. One sensor footprint takes IMX327LQR / IMX290LQR /
+IMX290LLR (there is no IMX327 mono). The sensor-side IO bank (VCCIO7) is 1.8 V natively — no level
+shifters. Reference design: Luckfox Pico Mini schematic (`PCB/reference/`), ported selectively.
+
+**PCB REQUIREMENTS REVISED (2026-10-15): read `PCB/HARDWARE-DESIGN-NOTES.md` §0 and §16 before §15.**
+One PCB now serves two products (OAG guider + a battery-powered Wi-Fi remote camera for Zenit
+Astronomy) as assembly variants; outline 50 × 50 mm trimmed to Ø56.5 (tube OD 59 mm); USB-C is the
+only power input (no diode-OR/mux); Wi-Fi module added; mount power + half-duplex UART arrive through
+USB-C (SBU) on a custom cable from the OAE mount's XH-4; Wi-Fi is never in the guiding/N.I.N.A. path.
+Schematic and placement have **not** been updated to this yet.
+
+**PCB HANDOFF (end of 2026-10-14): read `PCB/HARDWARE-DESIGN-NOTES.md` §15 first.** Schematic done and
+verified; PCB has outline, holes, 4 layers and a first-pass placement (sensor alone on the bottom/lens
+layer, all else on top), not routed. Open: user decisions to implement (thermal contact pad behind the
+sensor, sensor caps beside the sensor on the lens side, hand layout of buck/crystal/USB per datasheet)
+and three unanswered questions (SoC heat distance, XH plug zone, USB/header positions).
+
+**Schematic v1 drawn (2026-10-14), awaiting user review** — generated from
+`PCB/schematic/design.py` (edit that, not the drawing; `generate.py` redraws, `check.py` compares
+EasyEDA's netlist with the spec). Decisions and open review items: `PCB/HARDWARE-DESIGN-NOTES.md` §13;
+EasyEDA API quirks (label anchoring, negated y in attribute modify, A3 page swap): `PCB/schematic/README.md`.
+
+Original first-step note (superseded by the above): read `PCB/HARDWARE-DESIGN-NOTES.md`, then plan the RV1106G3 <->
+IMX327 core -- MIPI CSI-2 lanes, the sensor's three rails and their sequencing, 37.125 MHz INCK,
+XVS/XHS slave-mode pins (slave mode removes the VMAX exposure ceiling), plus the ST-4 jack and the
+LX200 UART header (see "Mount interface" above: fit both).
+
+## Hinted plate solving: feasibility started (2026-10-15)
+
+Lives in `PlateSolving/` — read `PlateSolving/README.md` first. Research only, nothing built. Verdict:
+compute/RAM are not the risk (a hinted solve reads a few ~5° catalogue tiles from flash, star list from
+the existing `guide_star_autofind()`); the blockers are the **catalogue licence** (Gaia is CC BY-NC, needs
+an ESA commercial licence; Tycho-2 terms unverified) and the **unmeasured limiting magnitude** (needs
+V 11–12 for 15–40 stars/field at the galactic poles). Chosen solver to port: **ASTAP** (MPL-2.0, Pascal,
+quad hashing, native hint), from upstream SourceForge, not the GitHub mirror. astrometry.net/StellarSolver
+rejected (GPL), tetra3 rejected (no hint, DB too large at 1.8°). Note the PCB baseline is now RV1103G1
+(64 MB), so the CMA 24M -> ~14M trim matters for production, not only this board.
+Follow-up same day: ESA licence deferred (user has contacts; prototyping proceeds). **NPU: not used** —
+only star extraction is convolution-shaped, it is already <1 s on CPU, and NPU tensors come out of the CMA
+we want to shrink. **RV1103 has no RTC** (datasheet: 24 MHz osc only) — time from LX200/browser/PC/build
+stamp; a hinted solve needs none, sync/polar alignment need ~month accuracy. Hint sources, cheapest
+first: previous solve, the pole for polar alignment, user entry on the page, LX200, NexStar, Alpaca
+Telescope client over USB (covers USB-only mounts). PCB item handed to the PCB session: J203's LX200 RX
+needs 5 V tolerance (buffer + series R) and ESD.
+Standalone use case (agreed 2026-10-15): DSLR user, no PC, runs polar alignment from the camera's web page
+on a phone/tablet. Time comes from the browser (`Date.now()`, no permission). **GPS via the browser does
+not work** — Geolocation needs a secure context and `http://169.254.x.y`/`http://192.168.4.1` isn't one —
+so location is manual entry stored in `/userdata` (1° is enough; PA itself needs only the date, location
+only adds alt/az wording and refraction). This use case implies Wi-Fi AP mode (phones can't reliably use
+the RNDIS gadget), which conflicts with the PCB's "Wi-Fi not in v1" — flagged in `PlateSolving/README.md`.
+**Correction to "Mount interface" above (read from OAT firmware `42d2982`, 2026-10-15):** OAT processes
+Meade commands only on `Serial` (its USB port) and on Wi-Fi (ESP32 builds) — **not on a spare UART**, so
+our LX200 header cannot talk to a stock OAT; needs an OAT firmware change, Wi-Fi, or USB host. OAT stores
+site lat/long in EEPROM (`:Gt#`/`:Gg#`, set `:St`/`:Sg`) — plan: read it, show it on the page, user edits
+write back. OAT does **not** keep time (boots at 2021-01-01, millis-based) so its RA is wrong until set —
+the camera should push the phone's time to it (`:SL`/`:SC`/`:SG`). Production will have Wi-Fi (user).
+A solve needs an RA/Dec hint, not site location; location matters for PA wording/refraction/sync.
+**Standalone scope (2026-10-15): the user is the OpenAstroTech maintainer** — OAT firmware changes are
+in scope. Standalone mode makes the camera the mount's "second PC": phone time -> mount, site from mount
+EEPROM (editable), goto/solve/sync/center from the web page, guide pulses on the same LX200 link. Plan,
+two-masters problem (PC also on the mount; proposed fix: an Alpaca Telescope pass-through in `alpacad`) and
+the OAT changes (Meade on a spare UART; a clock-set flag) are in `PlateSolving/STANDALONE.md`.
+**Decision (2026-10-15): a connected PC is always primary for the mount** — the camera never proxies
+the mount (Alpaca Telescope pass-through rejected). Arbitration lives in OAT firmware: PC claims on
+connect (ASCOM driver/OATControl), camera's channel becomes read-only while claimed. Camera's on-device
+guider also yields when an Alpaca client is connected. Detail in `PlateSolving/STANDALONE.md`.
+Refined same day: the camera's guide pulses **always pass** (double guiding is prevented camera-side: the
+on-device guider is off when an Alpaca *Camera* client is connected, in which case PHD2 on the PC guides).
+**Exception to read-only:** the camera's auto polar alignment may slew RA and drive OAT's AZ/ALT motors
+under a mount-granted **lease** even with a PC connected (no sync/time/site writes; mount restored before
+release; PC gets "busy" meanwhile).
+**Solver ported and measured (2026-10-15).** `PlateSolving/src/`: ASTAP's solver core + `.1476` reader
+ported to C from upstream SourceForge changeset `4ea2c2f5` (MPL-2.0 files), our own `.1476` writer,
+`make test` (synthetic Gaia-density sky, 6-row matrix, mutation-tested), and `solve_bench` for the board.
+**On the RV1103 with alpacad running: ~60 ms per solve, 0.64 MB peak RSS**, accuracy ~0.2" at the centre;
+no wrong solve in ~1800 trials; failures are fields with <10-15 stars (galactic poles need ~V 11.5).
+~1% of solves have 30-60" corner error from false quad matches (ASTAP has no residual rejection; centre
+still fine; `resid_max` flags it). Failure time is bounded by the search radius (20° default = 6.6 s on
+board; use 5-10° with a mount hint). Real V<12 catalogue ~14 MB. Next: real sky frames, real catalogue,
+and a saturated-stars-kept star-list mode of `guide_star_autofind()` for integration.
+**Plate-solving handoff (end of 2026-10-15): read `PlateSolving/HANDOFF.md` first** — state, user
+decisions, how to run the test/bench, open items (next: cross-check against ASTAP's real D05 database on
+the host; real sky frames; star-list mode of `guide_star_autofind()`; integration). Search radius costs
+time not RAM (~5 ms per 1° window on the board). Nothing from 2026-10-07 or 2026-10-15 is committed.
