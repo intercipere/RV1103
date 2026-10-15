@@ -1,8 +1,8 @@
 # Plate solving: handoff (end of session 2026-10-15)
 
 Read this first, then `README.md` for the detail and evidence, and `STANDALONE.md` for the
-phone-only / mount-control design. Everything here is **uncommitted**, in the working tree,
-alongside the also-uncommitted 2026-10-07 guiding work.
+phone-only / mount-control design. Committed in `f2b6a14d3` (2026-10-15), after the
+2026-10-07 guiding work in `a5ae70a36`.
 
 ## State in one paragraph
 

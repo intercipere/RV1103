@@ -1042,8 +1042,7 @@ RSS 19.3 MB. Next: the settings registry extracted from PHD2 (plan step 2).
 
 ## Where this stands (2026-10-07)
 
-Supersedes the 2026-09-17 status section above. **Nothing from 2026-10-07 is committed yet**;
-the working tree holds all of it (plus the untracked `PCB/`, not ours).
+Supersedes the 2026-09-17 status section above. Committed 2026-10-15 as `a5ae70a36`.
 
 **On the board right now** (hot-pushed via adb, `sync`'d; md5 matches the overlay copy, so a
 reflash reproduces it): `alpacad` with calibration, the simulated mount, the new PHD2-style page,
@@ -1071,7 +1070,7 @@ The single list of what is open. Detail lives in `Guiding/ROADMAP.md` (guiding e
 item closes, strike it here as well.
 
 **Housekeeping**
-- Commit the 2026-10-07 work (nothing from that day is committed).
+- ~~Commit the 2026-10-07 work~~ -- done 2026-10-15 (`a5ae70a36`).
 - Rebuild the SD-card image: the board runs newer `alpacad`, `insmod_ko.sh` and `sc3336.ko` than
   the last `./build.sh` output, so reflashing `output/image/sd_update.img` would roll them back.
 
@@ -1249,4 +1248,5 @@ and a saturated-stars-kept star-list mode of `guide_star_autofind()` for integra
 **Plate-solving handoff (end of 2026-10-15): read `PlateSolving/HANDOFF.md` first** — state, user
 decisions, how to run the test/bench, open items (next: cross-check against ASTAP's real D05 database on
 the host; real sky frames; star-list mode of `guide_star_autofind()`; integration). Search radius costs
-time not RAM (~5 ms per 1° window on the board). Nothing from 2026-10-07 or 2026-10-15 is committed.
+time not RAM (~5 ms per 1° window on the board). Committed 2026-10-15: guiding `a5ae70a36`, plate solving
+`f2b6a14d3`; `PCB/` and `.claude/` deliberately left untracked.
