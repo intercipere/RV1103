@@ -1,5 +1,6 @@
 #include "guide_loop.h"
 
+#include "guide_settings.h"
 #include "sensor.h"
 
 #include <math.h>
@@ -31,9 +32,11 @@ static struct {
 
 	/* requests from HTTP threads */
 	volatile int want_run;   /* 0 = idle, 1 = looping, 2 = guiding */
-	volatile int want_reselect;
+	volatile int want_reselect; /* 1 = next candidate, 2 = best (PHD2 Auto-select) */
 	volatile int want_source;   /* -1 = no change */
 	volatile double want_exposure;
+	volatile int want_clear_cal;
+	volatile int want_dec_mode; /* -1 = no change */
 	volatile int quit;
 
 	const sensor_desc_t *desc;
@@ -42,6 +45,10 @@ static struct {
 
 	guide_algo_t algo_ra, algo_dec;
 	double min_move;
+
+	/* Owned by the loop thread; HTTP threads only raise the want_* flags. */
+	guide_mount_t mount;
+	guide_cal_t cal;
 
 	int lock_x, lock_y;
 	double origin_x, origin_y;
@@ -57,13 +64,24 @@ static struct {
 
 	guide_status_t st;
 
-	unsigned char *preview;
+	/*
+	 * Double-buffered: build_preview() fills the back buffer with no lock
+	 * held, and publish_preview() swaps it in under g.lock together with the
+	 * overlay metadata. Building in place, as this used to, let an HTTP
+	 * thread copy a half-written preview.
+	 */
+	unsigned char *preview, *preview_back;
 	uint16_t *preview16; /* downsampled 10-bit, kept so the stretch is one pass */
-	size_t preview_len;
-	int preview_w, preview_h;
+	size_t preview_len, back_len;
+	int preview_w, preview_h, back_w, back_h;
+	int back_ready;
+	double back_ms; /* how long the back buffer took to build */
+	unsigned int back_lo, back_hi; /* its stretch */
+	guide_preview_meta_t pv_meta;
 } g = {
 	.lock = PTHREAD_MUTEX_INITIALIZER,
 	.want_source = -1,
+	.want_dec_mode = -1,
 	.want_exposure = 0.0,
 	.min_move = 0.15,
 };
@@ -74,39 +92,91 @@ static double now_ms(void) {
 	return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-static void history_push(double ra, double dec, double cra, double cdec) {
+/*
+ * The simulated source has no exposure of its own and would produce frames as
+ * fast as the CPU allows. Pace it like a camera: one frame per exposure, timed
+ * from the start of the iteration so processing time is not added on top.
+ * The floor keeps a 10 ms exposure from spinning the thread; the real sensor's
+ * own floor is its 133 ms shortest frame.
+ */
+#define SIM_MIN_PERIOD_MS 100.0
+static void sim_pace(double t_start_ms) {
+	double period = g.st.exposure_s * 1000.0, wait;
+	if (period < SIM_MIN_PERIOD_MS)
+		period = SIM_MIN_PERIOD_MS;
+	wait = period - (now_ms() - t_start_ms);
+	if (wait > 0)
+		usleep((useconds_t)(wait * 1000.0));
+}
+
+/* Caller holds g.lock and fills everything but seq and t. */
+static void history_push(guide_sample_t *s) {
 	guide_status_t *st = &g.st;
 	if (st->count == GUIDE_HISTORY) {
 		memmove(&st->history[0], &st->history[1],
 		        sizeof(st->history[0]) * (GUIDE_HISTORY - 1));
 		st->count--;
 	}
-	st->history[st->count].ra = (float)ra;
-	st->history[st->count].dec = (float)dec;
-	st->history[st->count].cra = (float)cra;
-	st->history[st->count].cdec = (float)cdec;
-	st->history[st->count].valid = 1;
-	st->count++;
+	if (st->steps == 0 || st->count == 0)
+		st->guide_t0_ms = now_ms();
+	s->seq = st->steps++;
+	s->t = (float)((now_ms() - st->guide_t0_ms) / 1000.0);
+	st->history[st->count++] = *s;
 }
 
-static void recompute_rms(void) {
-	guide_status_t *st = &g.st;
-	double sr = 0, sd = 0;
-	int i, n = 0;
-	for (i = 0; i < st->count; i++) {
-		if (!st->history[i].valid)
-			continue;
-		sr += (double)st->history[i].ra * st->history[i].ra;
-		sd += (double)st->history[i].dec * st->history[i].dec;
-		n++;
-	}
-	if (n == 0) {
-		st->rms_ra = st->rms_dec = st->rms_total = 0.0;
+/* The raw pixels around the star, for the star profile. Loop thread only;
+ * published with the preview. */
+static uint16_t g_crop_back[GUIDE_CROP * GUIDE_CROP], g_crop_pub[GUIDE_CROP * GUIDE_CROP];
+static int g_crop_back_x, g_crop_back_y, g_crop_back_valid;
+
+static void capture_crop(const guide_image_t *im, double sx, double sy) {
+	int x0 = (int)floor(sx + 0.5) - GUIDE_CROP / 2;
+	int y0 = (int)floor(sy + 0.5) - GUIDE_CROP / 2;
+	int x, y;
+	if (im->width < GUIDE_CROP || im->height < GUIDE_CROP)
 		return;
+	if (x0 < 0) x0 = 0;
+	if (y0 < 0) y0 = 0;
+	if (x0 > im->width - GUIDE_CROP) x0 = im->width - GUIDE_CROP;
+	if (y0 > im->height - GUIDE_CROP) y0 = im->height - GUIDE_CROP;
+	for (y = 0; y < GUIDE_CROP; y++)
+		for (x = 0; x < GUIDE_CROP; x++)
+			g_crop_back[y * GUIDE_CROP + x] = guide_px(im, x0 + x, y0 + y);
+	g_crop_back_x = x0;
+	g_crop_back_y = y0;
+	g_crop_back_valid = 1;
+}
+
+/* Copies the mount and calibration picture into the status. Caller holds
+ * g.lock. */
+static void publish_cal(void) {
+	guide_status_t *st = &g.st;
+	snprintf(st->mount_name, sizeof(st->mount_name), "%s",
+	         g.mount.name ? g.mount.name : "none");
+	st->mount_connected = g.mount.connected;
+	st->calibrated = guide_cal_is_calibrated(&g.cal);
+	st->cal = g.cal.cal;
+	st->cal_state = g.cal.state;
+	st->cal_dist_px = g.cal.distance_px;
+	st->dec_mode = g.cal.dec_mode;
+	snprintf(st->cal_status, sizeof(st->cal_status), "%s", g.cal.status);
+	snprintf(st->cal_advisory, sizeof(st->cal_advisory), "%s", g.cal.advisory);
+	/* Image scale, PHD2's MyFrame::GetPixelScale (binning is always 1). 0 means
+	 * unknown, where PHD2 uses 1.0 and falls back to pixels. */
+	st->focal_length_mm = guide_settings_get("/frame/focalLength");
+	st->pixel_um = g.desc ? g.desc->pixel_size_um_x : 0.0;
+	st->pixel_scale_arcsec = st->focal_length_mm > 0 && st->pixel_um > 0
+	                             ? 206.265 * st->pixel_um / st->focal_length_mm
+	                             : 0.0;
+}
+
+/* A calibration only means something if it ran to the end; one interrupted by
+ * Stop or Loop is discarded, as PHD2 does. */
+static void abandon_calibration(void) {
+	if (!g.cal.calibrated && g.cal.state != GUIDE_CAL_CLEARED) {
+		guide_cal_clear(&g.cal);
+		g.cal.status[0] = '\0';
 	}
-	st->rms_ra = sqrt(sr / n);
-	st->rms_dec = sqrt(sd / n);
-	st->rms_total = sqrt((sr + sd) / (2 * n));
 }
 
 /*
@@ -125,25 +195,60 @@ static void build_preview(const guide_image_t *im) {
 	unsigned long total, acc_n;
 	unsigned int lo = 0, hi = 1023;
 	unsigned int span;
+	double t0 = now_ms();
 
-	if (g.preview_len != need) {
-		unsigned char *p = realloc(g.preview, need);
+	/* The back buffer and preview16 belong to this thread alone, so they can
+	 * be resized without the lock. */
+	if (g.back_len != need) {
+		unsigned char *p = realloc(g.preview_back, need);
 		uint16_t *q = realloc(g.preview16, need * sizeof(uint16_t));
 		if (!p || !q) {
 			/* realloc failure leaves the originals valid; keep whichever
 			 * succeeded so the next call can try again from a sane state. */
-			if (p) g.preview = p;
+			if (p) g.preview_back = p;
 			if (q) g.preview16 = q;
 			return;
 		}
-		g.preview = p;
+		g.preview_back = p;
 		g.preview16 = q;
-		g.preview_len = need;
+		g.back_len = need;
 	}
-	g.preview_w = dw;
-	g.preview_h = dh;
+	g.back_w = dw;
+	g.back_h = dh;
 
 	memset(hist, 0, sizeof(hist));
+
+	/*
+	 * Column-major frames (alpacad's wire order, y_stride == 1) are walked in
+	 * storage order: each source column is read contiguously into a per-
+	 * preview-row accumulator. The generic loop below walks rows, which on this
+	 * layout strides 2.6 kB between consecutive reads -- measured on the board
+	 * at ~100 ms per frame, more than the 72 ms unpack, and the reason the
+	 * guide loop was CPU-bound at 5.5 frames/s. Same result either way.
+	 */
+	if (im->y_stride == 1 && dh <= 1024) {
+		unsigned int colacc[1024];
+		for (x = 0; x < dw; x++) {
+			memset(colacc, 0, sizeof(unsigned int) * (size_t)dh);
+			for (i = 0; i < f; i++) {
+				const uint16_t *col = im->px + (size_t)(x * f + i) * im->x_stride;
+				for (y = 0; y < dh; y++) {
+					const uint16_t *p = col + y * f;
+					unsigned int a = 0;
+					for (j = 0; j < f; j++)
+						a += p[j];
+					colacc[y] += a;
+				}
+			}
+			for (y = 0; y < dh; y++) {
+				unsigned int acc = colacc[y] / (unsigned)(f * f);
+				if (acc > 1023)
+					acc = 1023;
+				g.preview16[(size_t)y * dw + x] = (uint16_t)acc;
+				hist[acc]++;
+			}
+		}
+	} else
 	for (y = 0; y < dh; y++) {
 		for (x = 0; x < dw; x++) {
 			unsigned int acc = 0;
@@ -221,9 +326,49 @@ static void build_preview(const guide_image_t *im) {
 				o = 255;
 			else
 				o = 255u * (v - lo) / span;
-			g.preview[(size_t)y * dw + x] = (unsigned char)o;
+			g.preview_back[(size_t)y * dw + x] = (unsigned char)o;
 		}
 	}
+	g.back_ready = 1;
+	g.back_ms = now_ms() - t0;
+	g.back_lo = lo;
+	g.back_hi = hi;
+}
+
+/* Swaps a freshly built preview in and records what to draw over it. Caller
+ * holds g.lock and has already updated g.st for this frame. */
+static void publish_preview(void) {
+	guide_preview_meta_t *m = &g.pv_meta;
+	if (g.back_ready) {
+		unsigned char *p = g.preview;
+		size_t n = g.preview_len;
+		g.preview = g.preview_back;
+		g.preview_len = g.back_len;
+		g.preview_w = g.back_w;
+		g.preview_h = g.back_h;
+		g.preview_back = p;
+		g.back_len = n;
+		g.back_ready = 0;
+		g.st.last_preview_ms = g.back_ms;
+		m->stretch_lo = g.back_lo;
+		m->stretch_hi = g.back_hi;
+	}
+	if (g_crop_back_valid) {
+		memcpy(g_crop_pub, g_crop_back, sizeof(g_crop_pub));
+		m->crop_x = g_crop_back_x;
+		m->crop_y = g_crop_back_y;
+		m->crop_valid = 1;
+	}
+	m->frame = g.st.frame;
+	m->state = g.st.state;
+	m->selected = g.have_star;
+	m->star_found = g.st.star_found;
+	m->star_x = g.st.star_x;
+	m->star_y = g.st.star_y;
+	m->lock_valid = g.st.lock_valid;
+	m->lock_x = g.st.lock_x;
+	m->lock_y = g.st.lock_y;
+	m->search_region = SEARCH_REGION;
 }
 
 static int open_source(guide_source_kind_t kind) {
@@ -248,6 +393,22 @@ static int open_source(guide_source_kind_t kind) {
 	g.src_open = 1;
 	g.have_star = 0;
 
+	/* The simulated sky comes with a simulated mount; the real camera has no
+	 * mount backend yet. Bind against g.src, not the local copy: the mount
+	 * keeps a pointer to the source it moves. */
+	if (kind == GUIDE_SRC_SIM)
+		guide_source_sim_mount(&g.src, &g.mount);
+	else
+		guide_mount_none(&g.mount);
+	/* A calibration describes one mount; a different source is a different
+	 * one. Reopening the same source (Stop, then Start) keeps it, as PHD2
+	 * keeps its calibration across guiding sessions. */
+	int new_sky = (kind != g.st.source);
+	if (new_sky) {
+		guide_cal_clear(&g.cal);
+		g.cal.status[0] = g.cal.advisory[0] = '\0';
+	}
+
 	pthread_mutex_lock(&g.lock);
 	g.st.source = kind;
 	snprintf(g.st.source_name, sizeof(g.st.source_name), "%s",
@@ -256,14 +417,22 @@ static int open_source(guide_source_kind_t kind) {
 	g.st.height = g.src.height;
 	/* Counters describe one run against one source; carrying them across a
 	 * switch would make the frame and lost counts meaningless. */
-	g.st.count = 0;
+	/* A different source is a different sky: PHD2 keeps its graph across
+	 * stars and guiding runs (only Clear empties it), but nothing from the old
+	 * source means anything now. The epoch tells the page to drop its copy. */
+	if (new_sky) {
+		g.st.count = 0;
+		g.st.hist_epoch++;
+	}
 	g.st.frame = 0;
 	g.st.lost_frames = 0;
 	g.ncand = 0;
 	g.pick = 0;
-	g.st.rms_ra = g.st.rms_dec = g.st.rms_total = 0.0;
 	g.st.star_found = 0;
 	g.st.err[0] = '\0';
+	g.st.pulses = 0;
+	g.st.lock_valid = 0;
+	publish_cal();
 	pthread_mutex_unlock(&g.lock);
 
 	guide_algo_reset(&g.algo_ra);
@@ -277,10 +446,25 @@ static void *guide_thread(void *arg) {
 	(void)arg;
 
 	while (!g.quit) {
-		double t_frame, t_find;
+		double t_frame, t_find, t_iter = now_ms();
 		guide_star_t star;
 		guide_star_result_t r;
 		int want_sel, explicit_sel;
+		int cal_rc = GUIDE_CAL_CONTINUE;
+		guide_dir_t pulse_dir[2] = { GUIDE_DIR_NONE, GUIDE_DIR_NONE };
+		int pulse_ms[2] = { 0, 0 };
+
+		if (g.want_dec_mode >= 0) {
+			g.cal.dec_mode = (guide_dec_mode_t)g.want_dec_mode;
+			g.want_dec_mode = -1;
+		}
+		if (g.want_clear_cal) {
+			g.want_clear_cal = 0;
+			guide_cal_clear(&g.cal);
+			g.cal.status[0] = g.cal.advisory[0] = '\0';
+		}
+		if (g.want_run != 2)
+			abandon_calibration();
 
 		if (!g.want_run) {
 			if (g.src_open) {
@@ -290,6 +474,7 @@ static void *guide_thread(void *arg) {
 			pthread_mutex_lock(&g.lock);
 			if (g.st.state != GUIDE_STATE_ERROR)
 				g.st.state = GUIDE_STATE_STOPPED;
+			publish_cal();
 			pthread_mutex_unlock(&g.lock);
 			usleep(120 * 1000);
 			continue;
@@ -312,7 +497,9 @@ static void *guide_thread(void *arg) {
 			if (g.src_open)
 				guide_source_set_exposure(&g.src, e);
 		}
-		if (!g.src_open && open_source(GUIDE_SRC_V4L2) != 0) {
+		/* Reopen whichever source was last chosen -- after Stop, Start used
+		 * to come back on the camera even with Simulated selected. */
+		if (!g.src_open && open_source(g.st.source) != 0) {
 			g.want_run = 0;
 			continue;
 		}
@@ -370,7 +557,7 @@ static void *guide_thread(void *arg) {
 				g.ncand = n;
 				/* Advance on an explicit re-select; start at the brightest
 				 * when this is the loop picking a star on its own. */
-				g.pick = explicit_sel ? (g.pick + 1) % n : 0;
+				g.pick = explicit_sel == 1 ? (g.pick + 1) % n : 0;
 			}
 			if (n == 0) {
 				pthread_mutex_lock(&g.lock);
@@ -378,7 +565,11 @@ static void *guide_thread(void *arg) {
 				g.st.star_found = 0;
 				g.st.lost_frames++;
 				snprintf(g.st.err, sizeof(g.st.err), "no star found");
+				g.st.lock_valid = 0;
+				publish_preview();
 				pthread_mutex_unlock(&g.lock);
+				if (g.src.kind == GUIDE_SRC_SIM)
+					sim_pace(t_iter);
 				continue;
 			}
 			g.lock_x = (int)(g.cand[g.pick].x + 0.5);
@@ -386,9 +577,11 @@ static void *guide_thread(void *arg) {
 			g.origin_x = g.cand[g.pick].x;
 			g.origin_y = g.cand[g.pick].y;
 			g.have_star = 1;
-			g.st.count = 0;
 			guide_algo_reset(&g.algo_ra);
 			guide_algo_reset(&g.algo_dec);
+			/* Calibration measures one star's motion; switching stars part
+			 * way through would mix two. Start it again from this one. */
+			abandon_calibration();
 		}
 
 		/* With no star yet (looping before a selection) there is nothing to
@@ -402,10 +595,12 @@ static void *guide_thread(void *arg) {
 			g.st.star_found = 0;
 			g.st.star_index = -1;
 			g.st.star_count = 0;
+			g.st.lock_valid = 0;
+			publish_preview();
 			pthread_mutex_unlock(&g.lock);
 			guide_source_release(&g.src);
 			if (g.src.kind == GUIDE_SRC_SIM)
-				usleep(700 * 1000);
+				sim_pace(t_iter);
 			continue;
 		}
 
@@ -413,6 +608,9 @@ static void *guide_thread(void *arg) {
 		r = guide_star_find(&g.src.image, SEARCH_REGION, g.lock_x, g.lock_y,
 		                    MIN_HFD, MAX_HFD, &star);
 		t_find = now_ms() - t_find;
+		/* PHD2's profile keeps the last good data while the star is lost. */
+		if (r == GUIDE_STAR_OK)
+			capture_crop(&g.src.image, star.x, star.y);
 
 		if (!want_sel)
 			build_preview(&g.src.image);
@@ -422,6 +620,11 @@ static void *guide_thread(void *arg) {
 		g.st.last_frame_ms = t_frame;
 		g.st.last_find_ms = t_find;
 		g.st.last_result = r;
+		/* A new selection has no lock position until guiding sets one; a lost
+		 * frame otherwise keeps the old one, so the crosshair stays put while
+		 * the star is missing. */
+		if (want_sel)
+			g.st.lock_valid = 0;
 		/* A simulated source has no exposure; leave the requested value
 		 * showing rather than reporting 0. */
 		if (g.src.kind != GUIDE_SRC_SIM)
@@ -453,23 +656,114 @@ static void *guide_thread(void *arg) {
 			g.st.snr = star.snr;
 			g.st.hfd = star.hfd;
 			g.st.mass = star.mass;
+			g.st.peak = star.peak;
 			g.st.state = GUIDE_STATE_SELECTED;
 			g.st.err[0] = '\0';
+			g.st.lock_valid = 0;
 			g.lock_x = (int)(star.x + 0.5);
 			g.lock_y = (int)(star.y + 0.5);
 			/* Track the origin too, so switching to guiding starts from zero
 			 * error rather than from however far it drifted while looping. */
 			g.origin_x = star.x;
 			g.origin_y = star.y;
+		} else if (g.mount.connected && !guide_cal_is_calibrated(&g.cal)) {
+			/* Calibrating: one step per frame, the pulse sent after the
+			 * lock is dropped. PHD2 begins on entering the state and takes
+			 * its first measurement on the next frame. */
+			g.st.star_found = 1;
+			g.st.star_x = star.x;
+			g.st.star_y = star.y;
+			g.st.snr = star.snr;
+			g.st.hfd = star.hfd;
+			g.st.mass = star.mass;
+			g.st.peak = star.peak;
+			g.st.state = GUIDE_STATE_CALIBRATING;
+			g.st.err[0] = '\0';
+			g.st.lock_valid = 0;
+
+			/* Begin unless one is already under way. A COMPLETE but
+			 * insufficient calibration (RA only, Dec since enabled) starts
+			 * over; COMPLETE with calibrated == 0 is the Dec-off path waiting
+			 * one frame to install its result, and must be updated. */
+			if (g.cal.state == GUIDE_CAL_CLEARED || g.cal.calibrated) {
+				guide_cal_begin(&g.cal, &g.mount, star.x, star.y);
+				snprintf(g.cal.status, sizeof(g.cal.status), "Starting calibration");
+			} else {
+				cal_rc = guide_cal_update(&g.cal, &g.mount, star.x, star.y);
+				pulse_dir[0] = g.cal.move_dir;
+				pulse_ms[0] = g.cal.move_ms;
+			}
+			/* PHD2 draws the lock crosshair during calibration too (dotted
+			 * yellow), at the start point the nudges return the star to.
+			 * After begin/update, so the first frame shows this run's start
+			 * rather than the previous calibration's. */
+			if (g.cal.state != GUIDE_CAL_CLEARED && g.cal.initial.valid) {
+				g.st.lock_valid = 1;
+				g.st.lock_x = g.cal.initial.x;
+				g.st.lock_y = g.cal.initial.y;
+			}
+			if (cal_rc == GUIDE_CAL_DONE) {
+				/* PHD2 sets the lock position on entering GUIDING. */
+				g.origin_x = star.x;
+				g.origin_y = star.y;
+				g.st.lock_valid = 1;
+				g.st.lock_x = g.origin_x;
+				g.st.lock_y = g.origin_y;
+				guide_algo_reset(&g.algo_ra);
+				guide_algo_reset(&g.algo_dec);
+				g.st.state = GUIDE_STATE_GUIDING;
+			} else if (cal_rc == GUIDE_CAL_FAILED) {
+				/* PHD2 drops back out of guiding; keep the star and keep
+				 * looping so the failure can be read and retried. */
+				snprintf(g.st.err, sizeof(g.st.err), "%s", g.cal.err);
+				g.st.state = GUIDE_STATE_SELECTED;
+				g.want_run = 1;
+			}
+			g.lock_x = (int)(star.x + 0.5);
+			g.lock_y = (int)(star.y + 0.5);
 		} else {
 			double dx = star.x - g.origin_x;
 			double dy = star.y - g.origin_y;
-			double cra, cdec;
+			double ex, ey, cra, cdec;
+			guide_sample_t smp;
+
+			memset(&smp, 0, sizeof(smp));
+			smp.ra_dir = smp.dec_dir = GUIDE_DIR_NONE;
 
 			g.algo_ra.min_move = g.min_move;
 			g.algo_dec.min_move = g.min_move;
-			cra = guide_algo_result(&g.algo_ra, -dx);
-			cdec = guide_algo_result(&g.algo_dec, -dy);
+			if (g.mount.connected) {
+				/* Calibrated: PHD2's MoveOffset. The error is turned into
+				 * mount axes, the algorithms run there, and the result
+				 * becomes pulses. */
+				guide_move_t mv;
+				guide_cal_guide_step(&g.cal, &g.algo_ra, &g.algo_dec, dx, dy, &mv);
+				ex = mv.mount_x;
+				ey = mv.mount_y;
+				cra = mv.dist_x;
+				cdec = mv.dist_y;
+				pulse_dir[0] = mv.dir_x;
+				pulse_ms[0] = mv.ms_x;
+				pulse_dir[1] = mv.dir_y;
+				pulse_ms[1] = mv.ms_y;
+				g.st.pulse_dir_ra = mv.dir_x;
+				g.st.pulse_ms_ra = mv.ms_x;
+				g.st.pulse_dir_dec = mv.dir_y;
+				g.st.pulse_ms_dec = mv.ms_y;
+				smp.flags = GUIDE_SAMPLE_CALIBRATED |
+				            (mv.limited_x ? GUIDE_SAMPLE_RA_LIMITED : 0) |
+				            (mv.limited_y ? GUIDE_SAMPLE_DEC_LIMITED : 0);
+				smp.ra_ms = (short)mv.ms_x;
+				smp.dec_ms = (short)mv.ms_y;
+				smp.ra_dir = (signed char)(mv.ms_x ? mv.dir_x : GUIDE_DIR_NONE);
+				smp.dec_dir = (signed char)(mv.ms_y ? mv.dir_y : GUIDE_DIR_NONE);
+			} else {
+				/* No mount: measure only, in camera pixels. */
+				ex = dx;
+				ey = dy;
+				cra = guide_algo_result(&g.algo_ra, -dx);
+				cdec = guide_algo_result(&g.algo_dec, -dy);
+			}
 
 			g.st.star_found = 1;
 			g.st.star_x = star.x;
@@ -477,16 +771,31 @@ static void *guide_thread(void *arg) {
 			g.st.snr = star.snr;
 			g.st.hfd = star.hfd;
 			g.st.mass = star.mass;
+			g.st.peak = star.peak;
 			g.st.state = GUIDE_STATE_GUIDING;
 			g.st.err[0] = '\0';
-			history_push(dx, dy, cra, cdec);
-			recompute_rms();
+			g.st.lock_valid = 1;
+			g.st.lock_x = g.origin_x;
+			g.st.lock_y = g.origin_y;
+			smp.dx = (float)dx;
+			smp.dy = (float)dy;
+			if (smp.flags & GUIDE_SAMPLE_CALIBRATED) {
+				smp.ra = (float)ex;
+				smp.dec = (float)ey;
+			}
+			smp.cra = (float)cra;
+			smp.cdec = (float)cdec;
+			smp.mass = (float)star.mass;
+			smp.snr = (float)star.snr;
+			history_push(&smp);
 
 			/* Follow the star so it cannot walk out of the search region over
 			 * a long run; the reported error stays relative to the origin. */
 			g.lock_x = (int)(star.x + 0.5);
 			g.lock_y = (int)(star.y + 0.5);
 		}
+		publish_cal();
+		publish_preview();
 		pthread_mutex_unlock(&g.lock);
 
 		/* Everything needed from this frame -- the centroid and the preview --
@@ -495,11 +804,32 @@ static void *guide_thread(void *arg) {
 		 * between coexisting with an Alpaca client and being OOM-killed. */
 		guide_source_release(&g.src);
 
-		/* A simulated source produces frames as fast as the CPU allows, which
-		 * would spin this thread at 100% for no benefit. Pace it at something
-		 * near a plausible guide cadence. */
+		/* Pulses go out after the lock is dropped -- an ST-4 pulse blocks
+		 * for its whole duration -- and before the next exposure starts, so
+		 * that frame sees the mount at rest. RA first, then Dec, as PHD2. */
+		{
+			int i;
+			for (i = 0; i < 2; i++) {
+				char perr[128];
+				if (pulse_ms[i] <= 0)
+					continue;
+				if (guide_mount_pulse(&g.mount, pulse_dir[i], pulse_ms[i],
+				                      perr, sizeof(perr)) != 0) {
+					pthread_mutex_lock(&g.lock);
+					g.st.state = GUIDE_STATE_ERROR;
+					snprintf(g.st.err, sizeof(g.st.err), "mount: %s", perr);
+					pthread_mutex_unlock(&g.lock);
+					g.want_run = 0;
+					break;
+				}
+				pthread_mutex_lock(&g.lock);
+				g.st.pulses++;
+				pthread_mutex_unlock(&g.lock);
+			}
+		}
+
 		if (g.src.kind == GUIDE_SRC_SIM)
-			usleep(700 * 1000);
+			sim_pace(t_iter);
 	}
 
 	free(scratch);
@@ -509,6 +839,7 @@ static void *guide_thread(void *arg) {
 int guide_loop_init(const void *desc) {
 	g.desc = (const sensor_desc_t *)desc;
 	g.st.exposure_s = 0.5;
+	g.st.search_region = SEARCH_REGION;
 	g.st.pixel_scale_arcsec = 0.0;
 	g.st.source = GUIDE_SRC_V4L2;
 	snprintf(g.st.source_name, sizeof(g.st.source_name), "camera");
@@ -517,6 +848,9 @@ int guide_loop_init(const void *desc) {
 	g.min_move = 0.15;
 	guide_algo_init(&g.algo_ra, GUIDE_ALGO_HYSTERESIS, g.min_move);
 	guide_algo_init(&g.algo_dec, GUIDE_ALGO_RESIST_SWITCH, g.min_move);
+	guide_mount_none(&g.mount);
+	guide_cal_init(&g.cal);
+	publish_cal();
 	snprintf(g.st.algo_ra, sizeof(g.st.algo_ra), "%s",
 	         guide_algo_name(g.algo_ra.kind));
 	snprintf(g.st.algo_dec, sizeof(g.st.algo_dec), "%s",
@@ -535,7 +869,6 @@ static void reset_run(void) {
 	g.st.err[0] = '\0';
 	g.st.lost_frames = 0;
 	g.st.frame = 0;
-	g.st.count = 0;
 	if (g.st.state == GUIDE_STATE_ERROR)
 		g.st.state = GUIDE_STATE_STOPPED;
 	pthread_mutex_unlock(&g.lock);
@@ -555,7 +888,30 @@ void guide_loop_start(void) {
 }
 
 void guide_loop_stop(void) { g.want_run = 0; }
+
+void guide_loop_calibrate(void) {
+	g.want_clear_cal = 1;
+	guide_loop_start();
+}
+
+void guide_loop_clear_calibration(void) { g.want_clear_cal = 1; }
+
+void guide_loop_set_dec_mode(guide_dec_mode_t mode) {
+	if (mode < GUIDE_DEC_NONE || mode > GUIDE_DEC_SOUTH)
+		return;
+	g.want_dec_mode = (int)mode;
+}
 void guide_loop_reselect(void) { g.want_reselect = 1; }
+
+void guide_loop_autoselect(void) {
+	/* PHD2's Auto-select works from a looping guider; start looping if
+	 * nothing is running so the button does something from a standstill. */
+	g.want_reselect = 2;
+	if (!g.want_run) {
+		reset_run();
+		g.want_run = 1;
+	}
+}
 
 int guide_loop_set_source(guide_source_kind_t kind) {
 	if (kind != GUIDE_SRC_SIM && kind != GUIDE_SRC_V4L2)
@@ -604,7 +960,20 @@ size_t guide_loop_preview_size(void) {
 	return n;
 }
 
-size_t guide_loop_preview(unsigned char *out, size_t cap, int *w, int *h) {
+int guide_loop_crop(unsigned short *out, guide_preview_meta_t *meta) {
+	int ok;
+	pthread_mutex_lock(&g.lock);
+	ok = g.pv_meta.crop_valid;
+	if (ok)
+		memcpy(out, g_crop_pub, sizeof(g_crop_pub));
+	if (meta)
+		*meta = g.pv_meta;
+	pthread_mutex_unlock(&g.lock);
+	return ok;
+}
+
+size_t guide_loop_preview(unsigned char *out, size_t cap, int *w, int *h,
+                          guide_preview_meta_t *meta) {
 	size_t n;
 	pthread_mutex_lock(&g.lock);
 	n = g.preview_len;
@@ -616,6 +985,8 @@ size_t guide_loop_preview(unsigned char *out, size_t cap, int *w, int *h) {
 	memcpy(out, g.preview, n);
 	*w = g.preview_w;
 	*h = g.preview_h;
+	if (meta)
+		*meta = g.pv_meta;
 	pthread_mutex_unlock(&g.lock);
 	return n;
 }

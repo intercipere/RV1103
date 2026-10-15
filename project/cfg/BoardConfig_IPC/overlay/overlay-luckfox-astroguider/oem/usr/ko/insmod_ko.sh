@@ -41,23 +41,27 @@ __insmod videobuf2-cma-sg.ko
 # VTS_MAX (0xffff rows) x row_time, so this is the only lever left once
 # SC3336_VTS_MAX is already at the 16-bit register maximum.
 #
-# Measured on real hardware (2026-09-17):
+# Row time is (true HTS 2500) x hts_mult / 102 MHz pixel rate = 24.51 us x
+# hts_mult, measured with v4l2-ctl --stream-count (2026-09-17). An older table
+# here used 27.5 us from the vendor's wrong hts_def; these are corrected.
 #
-#   hts_mult | row time | ExposureMax | shortest capture (10ms request)
-#   ---------+----------+-------------+--------------------------------
-#          1 |  27.5 us |       1.80s |  ~0.2s
-#         12 |   329 us |      21.6s  |  ~1.0s
-#         52 |  1427 us |      93.5s  |  ~4.2s     (52 is the hard maximum:
-#                                                   HTS is 16-bit, base 1250)
+#   hts_mult | row time | ExposureMax | shortest frame (1296+64 rows)
+#   ---------+----------+-------------+------------------------------
+#          1 |  24.5 us |      1.61s  |   33 ms
+#          3 |  73.5 us |      4.82s  |  100 ms
+#          4 |  98.0 us |      6.42s  |  133 ms   <- shipped
+#         12 |   294 us |     19.27s  |  400 ms
+#         52 |  1275 us |     83.5s   |  1.73 s   (52 is the hard maximum:
+#                                                  HTS is 16-bit, base 1250)
 #
 # The right-hand column is the cost: row time scales everything, so a long
-# ceiling makes short exposures slow too (focusing and framing suffer, not
-# guiding, where the exposure itself dominates). 12 is the shipped default as
-# a deliberate balance -- 21.6s is already far past anything guiding needs,
-# while ~1s to return a short frame stays usable. Set it to 1 to restore stock
-# behaviour, or 52 if a single very long sub-exposure matters more than
-# interactive responsiveness. Takes effect at the next boot; no rebuild needed.
-__insmod sc3336.ko hts_mult=12
+# ceiling makes every frame slow, short exposures included -- the guide loop
+# and the /guide preview cannot run faster than one frame per shortest frame.
+# 4 is the shipped value (2026-10-07): guiding realistically needs at most
+# ~5s, and 4 is the smallest multiplier that clears it, at 7.5 frames/s. It
+# was 12 (19.27s ceiling, 2.5 frames/s) before. This also caps Alpaca clients'
+# ExposureMax. Takes effect at the next boot; no rebuild needed.
+__insmod sc3336.ko hts_mult=4
 
 __insmod video_rkcif.ko
 __insmod phy-rockchip-csi2-dphy-hw.ko

@@ -761,16 +761,18 @@ adb shell "killall alpacad; sleep 1; setsid /usr/bin/alpacad </dev/null >/tmp/al
 
 ## Known gaps / not yet done
 
-Kept honest as of **2026-09-16** (end of the setup-page session). Several entries that used to live here
+Kept honest as of **2026-10-07**. Several entries that used to live here
 have since been closed by sections further down this file; if you are adding to this list, re-read it
 first rather than appending, because a stale gap list is worse than none.
 
 - **No mid-capture cancellation.** `stopexposure`/`abortexposure` reset the reported state but the
   in-flight V4L2 `DQBUF` call still runs to completion in its worker thread; its result still lands in
-  `last_frame` when done. Tolerable while exposures are short, and now more of a real gap than it was,
-  since `ExposureMax` is ~0.9s rather than ~37ms.
-- **Single exposure at a time, not deeply concurrency-hardened.** `startexposure` refuses a second call
-  while one is in flight, but there is no queueing or cancellation beyond that.
+  `last_frame` when done. A real gap now that `ExposureMax` is 6.42 s (`hts_mult=4`); see "Exposure
+  abort: advertised, not implemented" below for the measured symptom and the plan.
+- **Concurrency: the capture path is serialised, cancellation is not.** `v4l2_exposure_lock()`
+  (added with the guide loop, 2026-09-18) makes "write controls -> capture" atomic, which closed the
+  two-workers-share-the-fd race. A second `startexposure` now waits rather than racing; there is still
+  no queueing or cancellation.
 - **Gain is pinned at 128 (1x) and client gain control is a no-op.** PUTs are accepted rather than
   errored, because real clients abort on an error. `vertical_blanking` is *not* pinned any more (see
   "Long exposures restored"), so this is now the only remaining pin.
@@ -785,10 +787,9 @@ first rather than appending, because a stale gap list is worse than none.
 - **Never run against the ASCOM Conformance tool.** Individual members have been checked by hand and
   against real clients; the conformance suite has not been run, and it probes edge cases (invalid ids,
   out-of-range values, member-before-connected ordering) that hand-testing does not.
-- **Boot-to-discoverable takes ~15-20s from plugging in**, not investigated. Most likely IPv4LL
-  probe/announce timing — RFC 3927 permits ~9s of probing before a bind is even attempted. The
-  `dhcpcd usb0 { timeout 1 }` override was added for this but its effect has never been timed
-  before/after on hardware.
+- ~~Boot-to-discoverable takes ~15-20s~~ -- **resolved 2026-09-17**: measured, the `timeout 1`
+  override disproved and removed, and usb0's link-local address now assigned directly
+  (`S51usb0-linklocal`), ready at t=6.4 s instead of t=16 s. The host's own IPv4LL delay remains.
 - **The dew heater's success path is unverified** — every failure mode is, but no real GPIO has ever been
   toggled. See the dew-heater section; that test belongs with the PCB.
 - **CDC-NCM vs RNDIS is an untested hypothesis.** Measured RNDIS throughput is 22.5MB/s against
@@ -1306,3 +1307,31 @@ Restarting only on abort leaves the normal path alone but depends on the client 
 
 Until this is implemented, `CanAbortExposure`/`CanStopExposure` returning `true` misrepresents the driver
 and is a likely ASCOM Conformance finding.
+
+## 2026-10-07: guide page moved to web/, settings store, pixel size and exposure ceiling
+
+Driver-level changes from the guiding/UI work (the guiding side is in `src/guide/README.md` and
+`Guiding/UI_PORTING_PLAN.md`):
+
+- **Browser pages are files now, not C strings.** `alpaca/web/` holds the HTML/CSS/JS;
+  `tools/embed_web.py` gzips them deterministically into the generated `src/web_assets.c`
+  (gitignored -- edit `web/`, never the `.c`), and `src/web.c` serves them under `/ui/` with
+  `Content-Encoding: gzip`, an ETag and `304` on revalidation. The device needs no zlib: the browser
+  decompresses. **The build now needs `python3` on the host**, for the embed step.
+  `curl` shows the raw gzip unless given `--compressed`. The setup page (`setup_api.c`) is still a C
+  string and can move the same way.
+- **On-device settings store** (`src/guide/guide_settings.c`), keyed by PHD2's config keys, persisted
+  to **`/userdata/guide.cfg`** (temp file + fsync + rename, so a bus-power cut cannot leave half a
+  file). Only settings the device implements are accepted. First one: `/frame/focalLength`, default
+  182 mm.
+- **SC3336 pixel size corrected from 2.0 to 2.45 um** (SmartSens spec; consistent with the 1/2.8"
+  format). Served to Alpaca clients as `PixelSizeX/Y`, so every client's plate scale was ~18% off
+  until now. Verified on the board: `pixelsizex` returns 2.45. IMX290/IMX327 confirmed at 2.9 um.
+- **`hts_mult` 12 -> 4** in the overlay's `insmod_ko.sh`: `ExposureMax` **6.42 s** (verified on the
+  board, `ExposureMin` 98.04 us = one row), shortest frame 133 ms. Guiding needs at most ~5 s, and 12x
+  held every frame to 400 ms. Clients that want longer single exposures lose that range; choosing the
+  multiplier per exposure at runtime would give both and needs a sensor-driver change.
+- **Hot-push note:** `adb shell "setsid sh -c '/usr/bin/alpacad </dev/null >/tmp/alpacad.log 2>&1' &"`
+  still dies with the adb session on this board; append `& sleep 1` inside the quoted command so the
+  detached process is running before the shell exits.
+

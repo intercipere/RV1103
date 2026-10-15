@@ -11,6 +11,8 @@
 #include "discovery.h"
 #include "guide/guide_api.h"
 #include "guide/guide_loop.h"
+#include "web.h"
+#include "guide/guide_settings.h"
 #include "management_api.h"
 #include "setup_api.h"
 #include "switch_api.h"
@@ -79,6 +81,10 @@ int main(void) {
 	 * /guide/control) asks it to, so an installation that only ever uses the
 	 * Alpaca camera pays nothing for it. It shares the streaming V4L2 device
 	 * with the exposure worker under v4l2_exposure_lock(). */
+	web_register(ctx);
+	/* /userdata, not /tmp: /tmp is a RAM disk, and settings must survive a
+	 * power cycle (same place as the dew heater state). */
+	guide_settings_init("/userdata/guide.cfg");
 	if (guide_loop_init(g_device.sensor) == 0)
 		guide_api_register(ctx);
 	else

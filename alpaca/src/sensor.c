@@ -28,8 +28,12 @@ static const sensor_desc_t known_sensors[] = {
 		.v4l2_fourcc = v4l2_fourcc('B', 'G', '1', '0'), /* 10-bit Bayer BGGR/GRGR */
 		.bayer = BAYER_BGGR,
 		.max_adu = 1023,
-		.pixel_size_um_x = 2.0,
-		.pixel_size_um_y = 2.0,
+		/* SmartSens spec: 2.45 um square (1/2.8"; 2304 x 2.45 um by
+		 * 1296 x 2.45 um is a 6.47 mm diagonal, consistent). Was 2.0, which
+		 * Alpaca served as PixelSizeX/Y and made clients' plate scale ~18%
+		 * too fine. Corrected 2026-10-07. */
+		.pixel_size_um_x = 2.45,
+		.pixel_size_um_y = 2.45,
 		.row_time_us = 0.0, /* filled in by sensor_detect */
 		.ctrl_exposure = "exposure",
 		.ctrl_gain = "analogue_gain",
@@ -50,7 +54,7 @@ static const sensor_desc_t known_sensors[] = {
 		.v4l2_fourcc = v4l2_fourcc('B', 'G', '1', '0'), /* TODO: confirm */
 		.bayer = BAYER_NONE, /* mono variant assumed for this project */
 		.max_adu = 1023,
-		.pixel_size_um_x = 2.9, /* TODO: confirm against datasheet */
+		.pixel_size_um_x = 2.9, /* Sony unit cell 2.9 x 2.9 um, IMX290 and IMX327 */
 		.pixel_size_um_y = 2.9,
 		.row_time_us = 0.0,
 		.ctrl_exposure = "exposure",

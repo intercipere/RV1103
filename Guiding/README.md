@@ -477,9 +477,16 @@ The loop is wired into the daemon and serves a live page. On this board that is
 is stable here and different on any other board; `dmesg | grep 'OAG: usb0'` prints it). The
 setup page links to it, which is how a user arriving via a client's Settings button finds it.
 
-It measures guiding; it does not yet perform it. There is no calibration and no ST-4 output,
-so corrections are computed and plotted but never sent to a mount — and without calibration
-the "RA/Dec" labels are really camera x/y.
+**Update 2026-10-07:** calibration now exists (ported from PHD2) and guiding closes the loop
+against a *simulated* mount -- the simulated frame source carries one. On the real camera
+there is still no mount output (no ST-4 or LX200 backend), so there it measures in camera
+pixels and sends nothing. The page has been rebuilt as a port of PHD2's interface: movable
+panels, PHD2's history graph, target and star profile, colour schemes. Details in
+`Guiding/UI_PORTING_PLAN.md` and `alpaca/src/guide/README.md`.
+
+*Original text (2026-09-18):* It measures guiding; it does not yet perform it. There is no
+calibration and no ST-4 output, so corrections are computed and plotted but never sent to a
+mount — and without calibration the "RA/Dec" labels are really camera x/y.
 
 The **frame-source toggle is on the page**: Camera runs the real sensor, Simulated draws
 stars at known positions and needs no sky, no mount and no light. Both verified on hardware.

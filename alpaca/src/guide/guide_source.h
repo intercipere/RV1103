@@ -1,6 +1,7 @@
 #ifndef GUIDE_SOURCE_H
 #define GUIDE_SOURCE_H
 
+#include "guide_mount.h"
 #include "guide_star.h"
 
 /*
@@ -49,20 +50,44 @@ typedef enum {
 #define GUIDE_SIM_MAX_STARS 12
 
 /* Half-width of the patch saved around each star. Must exceed the star's own
- * radius (8) plus the largest drift the simulator applies (~2), so restoring
- * the patch fully erases the previous frame's star. */
-#define GUIDE_SIM_PATCH_R 16
+ * drawn radius (8). The patch is saved wherever the star is drawn each frame,
+ * so it does not need to cover the motion between frames -- calibration moves
+ * stars 25 px and more, which a fixed patch at the start position could not. */
+#define GUIDE_SIM_PATCH_R 10
 #define GUIDE_SIM_PATCH_W (2 * GUIDE_SIM_PATCH_R + 1)
 
 typedef struct {
-	double x, y;   /* true position in the base frame, before drift */
+	double x, y;   /* true position in the base frame, before any motion */
 	double peak;
-	/* Pristine copy of the pixels this star is drawn over. Keeping these
-	 * rather than a whole second frame is what lets the simulated source run
-	 * on the board beside alpacad: 12 stars cost ~25 kB, a second frame would
-	 * cost 6 MB and the two together once got alpacad OOM-killed. */
+	/* Pristine copy of the pixels this star was last drawn over, and where.
+	 * Keeping these rather than a whole second frame is what lets the
+	 * simulated source run on the board beside alpacad: 12 stars cost ~10 kB,
+	 * a second frame would cost 6 MB and the two together once got alpacad
+	 * OOM-killed. */
 	uint16_t patch[GUIDE_SIM_PATCH_W * GUIDE_SIM_PATCH_W];
+	int patch_x, patch_y, has_patch;
 } guide_sim_star_t;
+
+/*
+ * The simulated mount: what the sky does, and what a guide pulse does to it.
+ * Stars move in mount axes -- RA from periodic error and pulses, Dec from
+ * polar-alignment drift and pulses through a backlash deadband -- and those
+ * axes are then rotated (and optionally mirrored) into the camera frame. The
+ * guider is told none of this; calibration has to discover the angle, the
+ * rates and the mirror on its own, and the test checks what it found.
+ */
+typedef struct {
+	double angle_deg;       /* direction a WEST pulse moves stars, camera frame */
+	int dec_flip;           /* Dec axis at angle-90 instead of angle+90 */
+	double ra_rate;         /* px per ms of pulse */
+	double dec_rate;
+	double dec_backlash_ms; /* pulse time eaten on every Dec reversal */
+	double pe_amplitude;    /* RA periodic error, px */
+	double pe_period;       /* frames */
+	double dec_drift;       /* px per frame */
+	double seeing;          /* px rms, per frame, both axes */
+	unsigned int seed;
+} guide_sim_mount_cfg_t;
 
 struct guide_source;
 typedef int (*guide_source_next_fn)(struct guide_source *);
@@ -86,6 +111,11 @@ typedef struct guide_source {
 	int nstars;
 	long frame;
 	double drift_x, drift_y; /* true offset applied to the last frame produced */
+	guide_sim_mount_cfg_t sim;
+	double sim_ra, sim_dec;  /* where pulses have put the mount, px, mount axes */
+	double sim_dec_slack;    /* backlash still to take up in the current direction */
+	guide_dir_t sim_dec_last;
+	long sim_pulses;
 
 	/* v4l2 (in-daemon only) */
 	const void *desc;      /* const sensor_desc_t *, opaque here */
@@ -109,6 +139,20 @@ int guide_source_open_camera(guide_source_t *src, const char *host, int port,
  */
 int guide_source_open_sim(guide_source_t *src, const char *base_path,
                           int width, int height, int nstars);
+
+/* The simulated mount's defaults: a 30 degree camera rotation, 0.0025 px/ms
+ * (a 750 ms calibration step moves 1.9 px), 300 ms of Dec backlash, 1.6 px of
+ * RA periodic error over 35 frames, slow Dec drift and 0.1 px seeing. */
+void guide_sim_mount_defaults(guide_sim_mount_cfg_t *cfg);
+
+/* Replaces the simulated mount's behaviour and resets it to the start. */
+void guide_source_sim_configure(guide_source_t *src, const guide_sim_mount_cfg_t *cfg);
+
+/*
+ * Binds a mount backend to a simulated source: pulses sent to `m` move this
+ * source's stars on the next frame. The source must outlive the binding.
+ */
+void guide_source_sim_mount(guide_source_t *src, guide_mount_t *m);
 
 /*
  * Opens the in-daemon V4L2 source. Only available inside alpacad, which already

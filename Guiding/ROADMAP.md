@@ -23,11 +23,26 @@ Working and hardware-verified:
 - **The loop, inside `alpacad`**, sharing the V4L2 device with the Alpaca exposure worker
   under a new `v4l2_exposure_lock()`. Verified: four full Alpaca `ImageBytes` captures served
   correctly while the guide loop ran concurrently.
-- **A page at `/guide`** with live preview, error graph, star cycling, and a camera/simulated
-  frame-source toggle.
+- **A page at `/guide`** -- rebuilt on 2026-10-07 as a port of PHD2's interface, see
+  `UI_PORTING_PLAN.md`: movable/closable panels with saved layouts (phone and desktop kept
+  separately), PHD2's history graph, target and star profile, PHD2's overlay colours, colour
+  schemes (Dark/OLED/Light/Night), and a toolbar with PHD2's exposure list.
+- **Frame rate**: 7.5 frames/s at short exposures on the board (was 2.5), from `hts_mult` 12 -> 4
+  (exposure ceiling 6.42 s, enough for guiding) and a 2.5x faster preview build.
+- **Image scale**: focal length is a device setting (default 182 mm, `/frame/focalLength`);
+  with the corrected 2.45 um SC3336 pixel that is 2.78''/px, so graph and target read in
+  arc-seconds.
 
-Not working, because it does not exist: **calibration** and **mount output**. Both are
-required before this guides anything. Today it measures guiding; it does not perform it.
+- **Calibration** (2026-10-07), ported from PHD2's `scope.cpp`/`mount.cpp`, plus Dec guide
+  mode and the calibrated guide step. Tested against a **simulated mount** that the
+  simulated frame source now carries: calibration recovers a hidden camera rotation, Dec
+  mirror and both guide rates, and closed-loop guiding cuts the true error from ~3.0 px to
+  ~0.36 px RMS at every geometry tried. Detail in `alpaca/src/guide/README.md`,
+  "Calibration".
+
+Not working, because it does not exist: **mount output** to real hardware. Calibration and
+guiding have only ever driven the simulator; ST-4 and LX200 backends behind
+`guide_mount_pulse()` are what stands between this and guiding a telescope.
 
 ---
 
@@ -121,8 +136,12 @@ month.
 |---|---|---|---|
 | **ST-4 GPIO driver + Camera `PulseGuide`** | ~150 lines, **easy** | Partly | Pattern exists in `switch_api.c`. Needs a logic analyser, then the PCB. Measure pulse timing jitter. |
 | **LX200 serial backend** | ~120 lines, **easy** | Partly | Syntax confirmed above. Testable against a serial loopback or a real OAT. |
-| **Calibration** | ~600-line port, **medium to write, hard to validate** | **No** | Reuse PHD2's directly — see below. |
-| **Dec guide mode** (auto/N/S/off) | ~20 lines, trivial | Yes | Gate the correction by sign. |
+| ~~Calibration~~ | **done** (2026-10-07) | Against the simulator | Ported; real-mount validation still needs a night. Parity, Dec comp and flip wait on a mount that reports position. |
+| **Calibration persistence** | ~60 lines, easy | Yes | Lost on `alpacad` restart today. The settings store (`guide_settings.c`, `/userdata/guide.cfg`) now exists to hold it. PHD2's Best Practices: "get a good calibration, then re-use it". |
+| **Settings registry from PHD2's source** | medium | Yes | Next UI step; see `UI_PORTING_PLAN.md`. Brings every PHD2 setting into the page without hand-building forms. |
+| **Runtime `hts_mult`** | medium, kernel driver | No (board) | Pick the row-time multiplier per exposure: 1x (33 ms frames) for short exposures, more only when a long one needs it. Today it is fixed at 4 at module load. |
+| **Click the image to select a star** | ~40 lines, easy | Yes | PHD2's manual selection. |
+| ~~Dec guide mode~~ | **done** | Yes | |
 | **Dithering + settle handshake** | ~150 lines, easy-medium | Yes | Offset the lock position; wait for error below threshold for N frames. Needed for any sequencer. |
 | **Lowpass2, ZFilter algorithms** | ~150 lines each, easy | Yes | Direct ports, same shape as the four already done. **Port them, do not write them** -- see below. |
 | **Gaussian Process / PPEC** | 48 KB + Eigen, **hard** | Yes | Heaviest thing in PHD2. Optional there too. Probably never worth it on this CPU. |
@@ -137,6 +156,9 @@ month.
 | **Guiding Assistant, Drift/Polar Align, Star-Cross** | each a project | No | Analysis tools. Low priority for a guider appliance. |
 
 ### Calibration: reuse PHD2's, and the difficulty is not where I first put it
+
+*(Done as described below — ported, not rewritten. The validation caveat still stands: it
+has calibrated a simulator, never a mount.)*
 
 An earlier version of this document rated calibration "hard" at ~400-600 lines. That
 conflated two different things, and the writing half was wrong. Measured against the actual

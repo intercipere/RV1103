@@ -11,6 +11,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 /* ------------------------------------------------------- tiny HTTP client -- */
 
 /*
@@ -462,11 +466,94 @@ static void sim_inject(uint16_t *px, const guide_image_t *im,
 	}
 }
 
+void guide_sim_mount_defaults(guide_sim_mount_cfg_t *cfg) {
+	memset(cfg, 0, sizeof(*cfg));
+	cfg->angle_deg = 30.0;
+	cfg->dec_flip = 0;
+	cfg->ra_rate = 0.0025;
+	cfg->dec_rate = 0.0025;
+	cfg->dec_backlash_ms = 300.0;
+	cfg->pe_amplitude = 1.6;
+	cfg->pe_period = 35.0;
+	cfg->dec_drift = 0.02;
+	cfg->seeing = 0.1;
+	cfg->seed = 12345;
+}
+
+void guide_source_sim_configure(guide_source_t *src, const guide_sim_mount_cfg_t *cfg) {
+	src->sim = *cfg;
+	src->sim_ra = 0.0;
+	src->sim_dec = 0.0;
+	/* Start as if the last Dec move was south, so the first north pulse has
+	 * the whole backlash to take up -- the state a real mount is usually in,
+	 * and the one that exercises calibration's backlash-clearing step. */
+	src->sim_dec_last = GUIDE_SOUTH;
+	src->sim_dec_slack = 0.0;
+	src->sim_pulses = 0;
+	src->frame = 0;
+}
+
+static int sim_pulse(void *ctx, guide_dir_t dir, int ms, char *err, size_t errlen) {
+	guide_source_t *src = ctx;
+	(void)err;
+	(void)errlen;
+
+	src->sim_pulses++;
+	switch (dir) {
+	case GUIDE_WEST: src->sim_ra += src->sim.ra_rate * ms; break;
+	case GUIDE_EAST: src->sim_ra -= src->sim.ra_rate * ms; break;
+	case GUIDE_NORTH:
+	case GUIDE_SOUTH: {
+		double eff = ms;
+		/* A reversal has to cross the gear gap before the axis moves. */
+		if (dir != src->sim_dec_last) {
+			src->sim_dec_slack = src->sim.dec_backlash_ms;
+			src->sim_dec_last = dir;
+		}
+		if (eff <= src->sim_dec_slack) {
+			src->sim_dec_slack -= eff;
+			eff = 0.0;
+		} else {
+			eff -= src->sim_dec_slack;
+			src->sim_dec_slack = 0.0;
+		}
+		src->sim_dec += (dir == GUIDE_NORTH ? 1.0 : -1.0) * src->sim.dec_rate * eff;
+		break;
+	}
+	default:
+		break;
+	}
+	/* No sleep: a pulse here takes effect on the next frame, which is all
+	 * the loop can observe anyway, and the host test runs hundreds of them. */
+	return 0;
+}
+
+void guide_source_sim_mount(guide_source_t *src, guide_mount_t *m) {
+	memset(m, 0, sizeof(*m));
+	m->name = "simulated";
+	m->connected = 1;
+	/* Behave like ST-4, the first real backend: no telemetry, and the
+	 * east-movement cable check runs. */
+	m->can_pulse_guide = 0;
+	m->ctx = src;
+	m->pulse = sim_pulse;
+}
+
+/* Standard normal from a 32-bit LCG via Box-Muller. Deterministic, so a test
+ * run is reproducible. */
+static double sim_gauss(unsigned int *seed) {
+	double u1, u2;
+	*seed = *seed * 1103515245u + 12345u;
+	u1 = ((*seed >> 8) + 1.0) / 16777217.0;
+	*seed = *seed * 1103515245u + 12345u;
+	u2 = (*seed >> 8) / 16777216.0;
+	return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+}
+
 int guide_source_open_sim(guide_source_t *src, const char *base_path,
                           int width, int height, int nstars) {
 	size_t npix = (size_t)width * height;
 	int i;
-	int px, py;
 
 	memset(src, 0, sizeof(*src));
 	src->kind = GUIDE_SRC_SIM;
@@ -520,54 +607,75 @@ int guide_source_open_sim(guide_source_t *src, const char *base_path,
 		src->stars[i].x = 220.0 + (i * 331) % (width - 460) + 0.37 * (i + 1);
 		src->stars[i].y = 200.0 + (i * 217) % (height - 420) + 0.21 * (i + 1);
 		src->stars[i].peak = 420.0 - i * 45.0;
+		src->stars[i].has_patch = 0;
+	}
 
-		/* Save the pristine pixels under this star, before anything is drawn. */
-		for (py = 0; py < GUIDE_SIM_PATCH_W; py++) {
-			int sy = (int)src->stars[i].y - GUIDE_SIM_PATCH_R + py;
-			for (px = 0; px < GUIDE_SIM_PATCH_W; px++) {
-				int sx = (int)src->stars[i].x - GUIDE_SIM_PATCH_R + px;
-				uint16_t v = 0;
-				if (sx >= 0 && sx < width && sy >= 0 && sy < height)
-					v = src->pixels[(size_t)sx * src->image.x_stride +
-					                (size_t)sy * src->image.y_stride];
-				src->stars[i].patch[py * GUIDE_SIM_PATCH_W + px] = v;
-			}
-		}
+	{
+		guide_sim_mount_cfg_t cfg;
+		guide_sim_mount_defaults(&cfg);
+		guide_source_sim_configure(src, &cfg);
 	}
 	src->next = sim_next;
 	return 0;
 }
 
-static int sim_next(guide_source_t *src) {
-	long f = src->frame;
-	int i, px, py;
-
-	/* A slow periodic term plus a slower one, which is what a worm-driven
-	 * mount actually does; the loop above must correct it without knowing. */
-	src->drift_x = 1.6 * sin((double)f / 5.5) + 0.25 * sin((double)f / 1.7);
-	src->drift_y = 0.9 * sin((double)f / 9.0 + 1.0);
-
-	/* Restore only what the previous frame's stars touched, then redraw. */
-	for (i = 0; i < src->nstars; i++) {
-		for (py = 0; py < GUIDE_SIM_PATCH_W; py++) {
-			int sy = (int)src->stars[i].y - GUIDE_SIM_PATCH_R + py;
-			if (sy < 0 || sy >= src->height)
+static void sim_patch(guide_source_t *src, guide_sim_star_t *s, int save) {
+	int px, py;
+	for (py = 0; py < GUIDE_SIM_PATCH_W; py++) {
+		int sy = s->patch_y - GUIDE_SIM_PATCH_R + py;
+		if (sy < 0 || sy >= src->height)
+			continue;
+		for (px = 0; px < GUIDE_SIM_PATCH_W; px++) {
+			int sx = s->patch_x - GUIDE_SIM_PATCH_R + px;
+			size_t i;
+			if (sx < 0 || sx >= src->width)
 				continue;
-			for (px = 0; px < GUIDE_SIM_PATCH_W; px++) {
-				int sx = (int)src->stars[i].x - GUIDE_SIM_PATCH_R + px;
-				if (sx < 0 || sx >= src->width)
-					continue;
-				src->pixels[(size_t)sx * src->image.x_stride +
-				            (size_t)sy * src->image.y_stride] =
-				    src->stars[i].patch[py * GUIDE_SIM_PATCH_W + px];
-			}
+			i = (size_t)sx * src->image.x_stride + (size_t)sy * src->image.y_stride;
+			if (save)
+				s->patch[py * GUIDE_SIM_PATCH_W + px] = src->pixels[i];
+			else
+				src->pixels[i] = s->patch[py * GUIDE_SIM_PATCH_W + px];
 		}
 	}
-	for (i = 0; i < src->nstars; i++)
-		sim_inject(src->pixels, &src->image,
-		           src->stars[i].x + src->drift_x,
-		           src->stars[i].y + src->drift_y,
-		           src->stars[i].peak);
+}
+
+static int sim_next(guide_source_t *src) {
+	const guide_sim_mount_cfg_t *c = &src->sim;
+	long f = src->frame;
+	double a = c->angle_deg * M_PI / 180.0;
+	double ad = a + (c->dec_flip ? -M_PI / 2.0 : M_PI / 2.0);
+	double ra, dec;
+	int i;
+
+	/* Mount axes: RA wanders with periodic error, Dec drifts with polar
+	 * misalignment, and both carry whatever the pulses have done. */
+	ra = src->sim_ra;
+	dec = src->sim_dec + c->dec_drift * (double)f;
+	if (c->pe_period > 0.0)
+		ra += c->pe_amplitude * sin(2.0 * M_PI * (double)f / c->pe_period);
+
+	src->drift_x = ra * cos(a) + dec * cos(ad);
+	src->drift_y = ra * sin(a) + dec * sin(ad);
+	if (c->seeing > 0.0) {
+		src->drift_x += c->seeing * sim_gauss(&src->sim.seed);
+		src->drift_y += c->seeing * sim_gauss(&src->sim.seed);
+	}
+
+	/* Undo the previous frame's stars in reverse drawing order, so where two
+	 * overlapped the earlier star's light is not baked into the base. */
+	for (i = src->nstars - 1; i >= 0; i--)
+		if (src->stars[i].has_patch)
+			sim_patch(src, &src->stars[i], 0);
+
+	for (i = 0; i < src->nstars; i++) {
+		guide_sim_star_t *s = &src->stars[i];
+		double cx = s->x + src->drift_x, cy = s->y + src->drift_y;
+		s->patch_x = (int)floor(cx + 0.5);
+		s->patch_y = (int)floor(cy + 0.5);
+		sim_patch(src, s, 1);
+		s->has_patch = 1;
+		sim_inject(src->pixels, &src->image, cx, cy, s->peak);
+	}
 	src->frame++;
 	return 0;
 }

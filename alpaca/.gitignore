@@ -1,3 +1,4 @@
 alpacad
 test_capture
 *.o
+web_assets.c

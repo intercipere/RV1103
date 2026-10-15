@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en" data-scheme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenAstroGuider</title>
+<link rel="stylesheet" href="/ui/guide/guide.css">
+</head>
+<body>
+<header class="appbar">
+  <h1>Guiding</h1>
+  <span class="pill" id="pill"><i class="dot"></i><span id="stateText">connecting</span></span>
+  <span class="since" id="meta"></span>
+  <span class="grow"></span>
+  <span class="addr" id="addr"></span>
+  <select id="scheme" aria-label="Colour scheme" title="Colour scheme"></select>
+  <div class="viewwrap">
+    <button id="viewBtn" aria-haspopup="true" aria-expanded="false">View</button>
+    <div class="menu" id="viewMenu" hidden></div>
+  </div>
+</header>
+<main id="dock" class="dock"></main>
+<footer class="status" id="status"></footer>
+<script src="/ui/guide/js/core.js"></script>
+<script src="/ui/guide/js/layout.js"></script>
+<script src="/ui/guide/js/panel-graph.js"></script>
+<script src="/ui/guide/js/panel-image.js"></script>
+<script src="/ui/guide/js/panel-controls.js"></script>
+<script src="/ui/guide/js/panel-target.js"></script>
+<script src="/ui/guide/js/panel-profile.js"></script>
+<script src="/ui/guide/js/app.js"></script>
+</body>
+</html>
