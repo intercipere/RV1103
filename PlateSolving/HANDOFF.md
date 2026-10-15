@@ -108,13 +108,15 @@ which is gone. Re-fetch single files with
    `guide_mount_pulse()` backend; OAT firmware arbitration; then goto / solve-sync-center,
    then polar alignment, ported from an established routine.
 
-## Things waiting on another session
+## PCB implications: handled
 
-The PCB session has not yet been told the plate-solving implications. Pass these on:
+The PCB session has taken the plate-solving items into `PCB/HARDWARE-DESIGN-NOTES.md` §16
+(commit `8487e0bc9` also marks the older notes here as superseded):
 
-- The LX200 RX on J203 needs 5 V tolerance (buffer + series R) and ESD.
-- The LX200 header cannot reach a stock OAT.
-- The Wi-Fi module's SDIO must work at 1.8 V (VCCIO6), and its 32 kHz clock needs checking.
-- No RTC and no USB host port are needed.
+- The LX200 UART is shared with a USB-C SBU link to OAE mounts. The 5 V-tolerant RX is a
+  74LVC1G08, laid out but unpopulated in v1 (§16.4).
+- Wi-Fi is in, on SDIO_M1 at 1.8 V. The recommended module, E103-RTL8189FTV, needs no
+  32 kHz clock (§16.8).
 
-A ready-to-paste note is in `README.md`, "What this means for the PCB".
+**Read §16 before any mount-link or Wi-Fi work.** It supersedes what `README.md` says
+about J203.
