@@ -117,6 +117,11 @@ than just pulses.
 header for OAT/LX200. The marginal BOM cost is a connector and four optocouplers; the
 capability difference is large, and this decision gets expensive to revisit once boards exist.
 
+> **Superseded for the PCB (2026-10-15), see `PCB/HARDWARE-DESIGN-NOTES.md` §16:** the OAE mount link is a
+> half-duplex UART on the USB-C SBU pins (custom XH-4 → USB-C cable, power on the same cable); ST-4 is a
+> reserved, unpopulated 5-pin connector for a separate RJ12 + opto kit; a 3-pin serial connector (TX, RX,
+> GND) is reserved, unpopulated, for other mounts. The board stays RV1103G1 (64 MB).
+
 ### Backend 3 — Alpaca Telescope client
 
 The RV becomes a client of a mount exposed over Alpaca. PHD2's `scope_alpaca.cpp` is a
@@ -243,6 +248,11 @@ four" one. ST-4 makes the mount move; serial makes calibration *better*.
 7. Binning/subframing when latency matters — it is also the largest remaining latency lever.
 
 ## Hardware decisions this implies
+
+> **Superseded for the PCB (2026-10-15), see `PCB/HARDWARE-DESIGN-NOTES.md` §16:** the OAE mount link is a
+> half-duplex UART on the USB-C SBU pins (custom XH-4 → USB-C cable, power on the same cable); ST-4 is a
+> reserved, unpopulated 5-pin connector for a separate RJ12 + opto kit; a 3-pin serial connector (TX, RX,
+> GND) is reserved, unpopulated, for other mounts. The board stays RV1103G1 (64 MB).
 
 - **ST-4 jack *and* a UART header on the PCB.** Both are cheap; only one is universal, and
   only the other lets the mount report declination — which is what separates compensated

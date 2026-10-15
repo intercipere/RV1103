@@ -505,6 +505,11 @@ raise it with ESA contacts later.)
 
 ## What this means for the PCB
 
+> **Update (2026-10-15):** taken into the PCB notes, `PCB/HARDWARE-DESIGN-NOTES.md` §16. The LX200 UART is
+> now shared with a USB-C SBU link to OAE mounts; the 5 V-tolerant RX is a 74LVC1G08 (merges both receive
+> paths), laid out but unpopulated in v1 (§16.4). Wi-Fi is in, on SDIO_M1 at 1.8 V; recommended module
+> E103-RTL8189FTV needs no 32 kHz clock (§16.8).
+
 Plate solving adds **almost nothing** to the board. Storage (1 Gbit SPI NAND, ~12 MB
 needed), RAM (64 MB, after the CMA trim) and the CPU are all enough as planned. The one real
 item is the **LX200 UART on header J203**, because it is the hint source and the sync path.
